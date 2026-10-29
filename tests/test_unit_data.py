@@ -495,7 +495,16 @@ def test_deseq2_norm_matches_reference_simulated():
     ids=["int_frame", "integral_float_array", "zeros"],
 )
 def test_valid_counts_accepts_non_negative_integers(counts):
-    misc.test_valid_counts(counts)
+    """Accepted counts return None, and a dataset built from them holds them unchanged,
+    as integers (integral floats included)."""
+    assert misc.test_valid_counts(counts) is None
+
+    samples = ["s1", "s2"]
+    metadata = pd.DataFrame({"condition": ["A", "B"]}, index=samples)
+    frame = pd.DataFrame(np.asarray(counts), index=samples, columns=["g1", "g2"])
+    dds = helpers.make_dds(frame, metadata)
+    assert np.issubdtype(dds.X.dtype, np.integer)
+    np.testing.assert_array_equal(dds.X, np.asarray(counts))
 
 
 @pytest.mark.parametrize(

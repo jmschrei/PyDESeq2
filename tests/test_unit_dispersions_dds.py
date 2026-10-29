@@ -16,6 +16,7 @@ from scipy.special import polygamma
 
 from pydeseq2.default_inference import DefaultInference
 from tests import helpers
+from tests.test_unit_dispersions import BOUND_RTOL
 from tests.test_unit_dispersions import DISPERSION_RTOL
 from tests.test_unit_dispersions import _lin_reg_mu
 from tests.test_unit_dispersions import _moments_dispersions
@@ -97,8 +98,9 @@ def test_genewise_and_map_dispersions_glm_means():
     at a relative deviance change of 1e-8, which moved the dispersions by up to
     1.3e-4 relative on the measured cases, inside ``DISPERSION_RTOL``.
 
-    Left out: genes whose start is at ``min_disp`` (gene-wise only; see
-    known-bugs/genewise-dispersion-floor-start.md) and genes with a fitted mean
+    Left out: genes whose start is at ``min_disp`` (gene-wise only: there the
+    objective is flat in log dispersion, and PyDESeq2, like DESeq2 1.50.2, stays at
+    ``min_disp`` even when the minimizer is elsewhere) and genes with a fitted mean
     below ``min_mu`` (IRLS clamps them, the reference does not).
     """
     sim = helpers.simulate_counts(
@@ -197,8 +199,8 @@ def test_genewise_dispersions_capped_at_max_disp(n_samples, max_disp):
 
     The bound is ``max(max_disp, n_samples)``, as the ``DeseqDataSet`` docstring
     says. The reference minimizer of the Cox-Reid objective at the linear-model
-    means also sits on that bound for these genes, so the expected value is the
-    bound itself (to rounding, 1e-12).
+    means sits on that bound for these genes (to rounding, 1e-12), so the expected
+    value is the bound itself, within ``BOUND_RTOL``.
     """
     sim = helpers.simulate_counts(
         n_genes=20, n_samples=n_samples, seed=51, n_single_sample=2
@@ -217,7 +219,7 @@ def test_genewise_dispersions_capped_at_max_disp(n_samples, max_disp):
         )
         assert expected == pytest.approx(bound, rel=1e-12)
         assert dds.var.loc[gene, "genewise_dispersions"] == pytest.approx(
-            bound, rel=1e-12
+            bound, rel=BOUND_RTOL
         )
     assert (dds.var["genewise_dispersions"] <= bound).all()
 
@@ -227,11 +229,11 @@ def test_genewise_dispersions_with_min_disp():
 
     Every gene is compared with the reference minimizer over ``[0.01, max_disp]`` at
     the linear-model means. 47 genes start on the bound here (their ``min(rough,
-    moments)`` is below 0.01); unlike at ``min_disp=1e-8`` (see
-    known-bugs/genewise-dispersion-floor-start.md), each of them whose minimizer is
-    inside moved off the bound on base PyDESeq2, so no gene is left out. At least 20
-    of the 150 genes have their minimizer on the bound; those must be 0.01 (to
-    rounding).
+    moments)`` is below 0.01). At ``min_disp=1e-8`` a gene that starts on the bound
+    stays there, because the objective is flat in log dispersion so close to zero;
+    at 0.01 it is not, and every gene here whose minimizer is inside moves off the
+    bound, so no gene is left out. At least 20 of the 150 genes have their minimizer
+    on the bound; those must be 0.01 (``BOUND_RTOL``).
     """
     sim = helpers.simulate_counts(
         n_genes=150, n_samples=10, seed=9, disp_scatter=1.0, trend=(0.02, 1.0)
@@ -258,7 +260,70 @@ def test_genewise_dispersions_with_min_disp():
         name="genewise_dispersions",
     )
     np.testing.assert_allclose(
-        dds.var["genewise_dispersions"][at_bound], 0.01, rtol=1e-12
+        dds.var["genewise_dispersions"][at_bound], 0.01, rtol=BOUND_RTOL
+    )
+
+
+def test_dispersions_of_genes_with_an_all_zero_group():
+    """Genes with no counts in one of two groups.
+
+    The linear-model mean of the empty group is 0. DESeq2 scales the fitted
+    normalized means by the size factors and then floors them at ``min_mu=0.5``
+    (``linearModelMuNormalized``, then ``pmax(mu, minmu)``), so every sample of that
+    group gets a mean of 0.5 whatever its size factor; ``_lin_reg_mu`` does the
+    same. Gene-wise and MAP dispersions of these genes and of the regular ones are
+    compared with the reference at those means (``DISPERSION_RTOL``). Flooring before
+    the scaling moves these genes' dispersions by 4% to 17%.
+    """
+    sim = helpers.simulate_counts(
+        n_genes=40, n_samples=10, seed=59, disp_scatter=0.3, size_factor_sd=0.5
+    )
+    in_b = (sim.metadata["condition"] == "B").to_numpy()
+    rs = np.random.RandomState(59)
+    means = np.exp(rs.uniform(np.log(5), np.log(60), size=8))
+    one_group = np.zeros((10, 8), dtype=np.int64)
+    for j in range(8):
+        mu_b = sim.size_factors.to_numpy()[in_b] * means[j]
+        one_group[in_b, j] = rs.negative_binomial(n=1 / 0.4, p=1 / (1 + 0.4 * mu_b))
+    names = [f"one_group{j + 1}" for j in range(8)]
+    counts = pd.concat(
+        [sim.counts, pd.DataFrame(one_group, index=sim.counts.index, columns=names)],
+        axis=1,
+    )
+    dds = _fit_dispersions(helpers.make_dds(counts, sim.metadata))
+
+    sf = dds.obs["size_factors"].to_numpy()
+    x = sim.design_matrix.to_numpy()
+    mu = _lin_reg_mu(dds.X, sf, x)
+    assert (mu[~in_b][:, -8:] == 0.5).all()
+    start = _starting_dispersions(dds, sf, x, max(10.0, dds.n_obs))
+    fitted = dds.var["fitted_dispersions"].to_numpy()
+    prior_var = float(dds.uns["prior_disp_var"])
+    genewise = np.full(dds.n_vars, np.nan)
+    map_disp = np.empty(dds.n_vars)
+    for j in range(dds.n_vars):
+        if start[j] > dds.min_disp:
+            genewise[j] = helpers.reference_dispersion_mle(dds.X[:, j], mu[:, j], x)
+        map_disp[j] = helpers.reference_dispersion_mle(
+            dds.X[:, j],
+            mu[:, j],
+            x,
+            prior_disp_var=prior_var,
+            prior_dispersion=fitted[j],
+        )
+    compared = ~np.isnan(genewise)
+    assert compared[-8:].all()
+    helpers.assert_fields_close(
+        dds.var["genewise_dispersions"][compared],
+        pd.Series(genewise[compared], index=dds.var_names[compared]),
+        rtol=DISPERSION_RTOL,
+        name="genewise_dispersions",
+    )
+    helpers.assert_fields_close(
+        dds.var["MAP_dispersions"],
+        pd.Series(map_disp, index=dds.var_names),
+        rtol=DISPERSION_RTOL,
+        name="MAP_dispersions",
     )
 
 
@@ -419,6 +484,8 @@ def test_fit_dispersion_prior_warns_with_few_degrees_of_freedom():
     dds.fit_dispersion_trend()
     with pytest.warns(UserWarning, match="residual degrees of freedom is less than 3"):
         dds.fit_dispersion_prior()
+    # DESeq2 replaces this formula by a simulation-based estimate at three or fewer
+    # residual degrees of freedom; PyDESeq2 keeps the formula and warns.
     raw = _squared_log_residual_mad(dds) - polygamma(1, 3 / 2)
     assert float(dds.uns["prior_disp_var"]) == pytest.approx(max(raw, 0.25), rel=1e-10)
 
@@ -432,7 +499,8 @@ def test_map_dispersions_and_outlier_rule():
     MAP: the reference minimizes the Cox-Reid objective plus a normal prior on log
     dispersion centred on ``var["fitted_dispersions"]`` with variance
     ``uns["prior_disp_var"]``, at the linear-model means, for every non-zero gene
-    (``DISPERSION_RTOL``; every MAP fit here converges on base PyDESeq2).
+    (``DISPERSION_RTOL``; every MAP fit here converges, so none reaches the grid
+    fallback, which drops the prior).
 
     Final: DESeq2 keeps the gene-wise estimate for dispersion outliers, genes with
     ``log(genewise) > log(fitted) + 2 sqrt(varLogDispEsts)``, and the MAP estimate
@@ -511,7 +579,14 @@ def _assert_same_dispersions(actual, expected, name):
 
 
 @pytest.mark.parametrize(
-    "variant", ["permuted", "batch_size=3", "n_cpus=2", "n_cpus=2,batch_size=4"]
+    "variant",
+    [
+        "permuted",
+        "batch_size=3",
+        "n_cpus=2",
+        "n_cpus=2,batch_size=4",
+        "glm_means,permuted,n_cpus=2,batch_size=4",
+    ],
 )
 def test_dispersions_invariant_to_gene_order_batch_size_and_n_cpus(n_cpus, variant):
     """Gene order, ``batch_size`` and ``n_cpus`` do not change any dispersion output.
@@ -520,27 +595,41 @@ def test_dispersions_invariant_to_gene_order_batch_size_and_n_cpus(n_cpus, varia
     once with genes in order at ``batch_size`` 128 and once with the variant.
     Outputs are matched by gene name and compared within ``DISPERSION_RTOL``, the
     precision a reorganized solver is held to; the trend and prior variance move
-    with the gene-wise inputs, so they share that tolerance.
+    with the gene-wise inputs, so they share that tolerance. ``glm_means`` uses
+    ``~condition + age``, so the gene-wise means come from IRLS instead of the
+    linear model.
     """
+    options = variant.split(",")
+    continuous = ("age",) if "glm_means" in options else ()
     sim = helpers.simulate_counts(
-        n_genes=58, n_samples=8, seed=57, disp_scatter=0.5, n_all_zero=2
+        n_genes=58,
+        n_samples=8,
+        seed=57,
+        disp_scatter=0.5,
+        n_all_zero=2,
+        continuous=continuous,
     )
     base = _fit_dispersions(
         helpers.make_dds(
-            sim.counts, sim.metadata, inference=DefaultInference(n_cpus=n_cpus)
+            sim.counts,
+            sim.metadata,
+            design=sim.design,
+            inference=DefaultInference(n_cpus=n_cpus),
         )
     )
 
-    settings = dict(item.split("=") for item in variant.split(",") if "=" in item)
+    settings = dict(item.split("=") for item in options if "=" in item)
     variant_inference = DefaultInference(
         n_cpus=int(settings.get("n_cpus", n_cpus)),
         batch_size=int(settings.get("batch_size", 128)),
     )
     counts = sim.counts
-    if variant == "permuted":
+    if "permuted" in options:
         counts = counts.iloc[:, np.random.RandomState(1).permutation(counts.shape[1])]
     other = _fit_dispersions(
-        helpers.make_dds(counts, sim.metadata, inference=variant_inference)
+        helpers.make_dds(
+            counts, sim.metadata, design=sim.design, inference=variant_inference
+        )
     )
     _assert_same_dispersions(
         _dispersion_outputs(other), _dispersion_outputs(base), name=variant

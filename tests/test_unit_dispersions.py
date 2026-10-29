@@ -37,6 +37,12 @@ DISPERSION_RTOL = 1e-3
 # to 9.4e-6). Such genes are compared by objective value with a 10x margin.
 OBJECTIVE_ATOL = 1e-4
 
+# Genes whose objective decreases towards a bound. L-BFGS-B projects onto the bound
+# and returns it to rounding, but a solver that stops on a projected gradient of 1e-5
+# in log dispersion may stop up to 1e-5 inside it, which is up to 1e-5 relative in
+# dispersion; 1e-4 leaves a 10x margin and still tells the bounds apart.
+BOUND_RTOL = 1e-4
+
 
 def _grid_log_tolerance(min_disp, max_disp, grid_length=100):
     """Error bound of ``grid_fit_alpha`` in log dispersion, plus a 2x margin.
@@ -532,7 +538,8 @@ def _two_group_design(n_samples):
 
 def test_fit_alpha_mle_at_max_disp():
     """The objective decreases up to ``max_disp`` (see the grid test above), so the
-    bounded optimizer stops on the bound: ``max_disp`` to rounding (1e-12)."""
+    bounded optimizer stops on the bound: the reference minimizer is ``max_disp`` to
+    rounding (1e-12), and ``fit_alpha_mle`` is within ``BOUND_RTOL`` of it."""
     x = _two_group_design(8)
     y = np.array([0, 0, 0, 40, 0, 0, 0, 0])
     mu = np.full(8, 5.0)
@@ -540,16 +547,16 @@ def test_fit_alpha_mle_at_max_disp():
     for max_disp in (10.0, 3.0):
         alpha, converged = fit_alpha_mle(y, x, mu, 0.1, 1e-8, max_disp)
         assert converged
-        assert alpha == pytest.approx(max_disp, rel=1e-12)
+        assert alpha == pytest.approx(max_disp, rel=BOUND_RTOL)
 
 
 def test_fit_alpha_mle_at_min_disp():
     """An underdispersed gene: the objective increases in alpha from the lower bound.
 
-    With ``min_disp=0.01`` the optimizer stops on the bound (to rounding, 1e-12).
-    With ``min_disp=1e-8`` the objective is flat in log dispersion near the bound,
-    so L-BFGS-B stops above it (near 3e-7 here); the test compares objective values
-    there (``OBJECTIVE_ATOL``).
+    With ``min_disp=0.01`` the reference minimizer is on the bound (to rounding,
+    1e-12) and the optimizer stops there (``BOUND_RTOL``). With ``min_disp=1e-8`` the
+    objective is flat in log dispersion near the bound, so L-BFGS-B stops above it
+    (near 3e-7 here); the test compares objective values there (``OBJECTIVE_ATOL``).
     """
     x = _two_group_design(8)
     y = np.array([10, 11, 9, 10, 10, 11, 9, 10])
@@ -561,7 +568,7 @@ def test_fit_alpha_mle_at_min_disp():
     for alpha_hat in (0.1, 1.0):
         alpha, converged = fit_alpha_mle(y, x, mu, alpha_hat, 0.01, 10.0)
         assert converged
-        assert alpha == pytest.approx(0.01, rel=1e-12)
+        assert alpha == pytest.approx(0.01, rel=BOUND_RTOL)
 
         alpha, converged = fit_alpha_mle(y, x, mu, alpha_hat, 1e-8, 10.0)
         expected = helpers.reference_dispersion_mle(y, mu, x)
@@ -619,17 +626,17 @@ def test_fit_alpha_mle_bfgs():
 def test_fit_alpha_mle_converged_or_grid(inference, n_samples, seed, genes):
     """Every gene lands near the minimizer, by L-BFGS-B or by the grid fallback.
 
-    The genes include ones where L-BFGS-B stops with an abnormal line search on
-    base PyDESeq2 (gene18 and large2 of the first case, gene24 of the second, large2
-    and large3 of the third, under scipy 1.15.0 and 1.18.1): their objectives are
-    flat to rounding near the minimizer (means up to 1e7). The documented contract
-    is checked either way, through ``fit_alpha_mle`` and through
+    The genes include ones where L-BFGS-B, as PyDESeq2 calls it, stops with an
+    abnormal line search (gene18 and large2 of the first case, gene24 of the second,
+    large2 and large3 of the third, under scipy 1.15.0 and 1.18.1): their objectives
+    are flat to rounding near the minimizer (means up to 1e7). The documented
+    contract is checked either way, through ``fit_alpha_mle`` and through
     ``DefaultInference.alpha_mle`` (which reports the flag per gene): a converged
     fit is within ``DISPERSION_RTOL`` of the reference, and a non-converged one is
     the grid estimate, within the grid's resolution of it
-    (``_grid_log_tolerance``). On base PyDESeq2 the grid estimate of gene24 is
-    1.7e-3 from the reference, outside ``DISPERSION_RTOL``, so a flag reported as
-    converged for it fails. Which genes fail is not asserted.
+    (``_grid_log_tolerance``). The grid estimate of gene24 is 1.7e-3 from the
+    reference, outside ``DISPERSION_RTOL``, so a grid estimate reported as converged
+    for it fails. Which genes fail is not asserted.
     """
     sim = helpers.simulate_counts(
         n_genes=100, n_samples=n_samples, seed=seed, disp_scatter=0.5, n_large=3
@@ -711,9 +718,10 @@ def test_alpha_mle_matches_reference(inference):
     different ``alpha_hat`` per gene, ``prior_disp_var`` 0.3). Converged genes are
     within ``DISPERSION_RTOL`` of the reference. Gene-wise genes that did not
     converge are within the grid fallback's resolution. MAP genes that did not
-    converge are left out: the fallback drops the prior
-    (known-bugs/map-dispersion-grid-fallback-drops-prior.md); at least 95% must
-    converge.
+    converge are left out: ``fit_alpha_mle`` calls the grid fallback without the
+    prior (``prior_disp_var``, ``cr_reg`` and ``prior_reg`` are not passed on), so
+    those genes get the gene-wise estimate instead of the MAP one, where DESeq2's
+    grid fallback keeps the prior. At least 95% must converge.
     """
     sim, prior = _alpha_mle_case()
     y = sim.counts.to_numpy()
