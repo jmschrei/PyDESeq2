@@ -281,6 +281,125 @@ def test_reference_glm_mle_is_stationary():
             assert objective(beta) <= objective(beta - step)
 
 
+@pytest.mark.parametrize("disp", [0.01, 0.05, 0.1, 0.2, 1.0])
+def test_reference_glm_mle_large_counts(disp):
+    """Converges on counts near 1e7, where the objective cannot resolve the last
+    Newton steps (its log-likelihood terms reach 4e8, so its rounding is near 1e-7).
+
+    With a stop rule of an absolute 1e-10 step and an objective-based line search,
+    the iteration stalled here at dispersions 0.05 to 0.2. The gradient at the
+    result is at its rounding level: it sums 13 terms ``(y - mu) / (1 + disp mu)``
+    of size below 100, so 1e-10 leaves a wide margin.
+    """
+    sim = helpers.simulate_counts(
+        n_genes=1, n_samples=13, seed=21, n_large=1, disp_scatter=0.3
+    )
+    x, sf = sim.design_matrix.to_numpy(), sim.size_factors.to_numpy()
+    y = sim.counts["large1"].to_numpy(dtype=float)
+    assert y.min() > 4e6
+    beta = helpers.reference_glm_mle(y, sf, x, disp)
+    mu = sf * np.exp(x @ beta)
+    grad = -x.T @ ((y - mu) / (1 + disp * mu)) + 1e-6 * beta
+    assert np.max(np.abs(grad)) < 1e-10
+
+
+def test_reference_independent_filtering_hand_worked():
+    """``reference_independent_filtering`` on a small worked case.
+
+    With no more than 10 rejections at any quantile the first quantile is chosen,
+    which keeps every gene with a non-zero mean; the adjusted p-values are then BH
+    over those genes (worked below).
+    """
+    base_mean = np.array([0.0, 5.0, 10.0, 20.0, 40.0])
+    p = np.array([np.nan, 0.01, 0.04, 0.03, 0.5])
+    adjusted, chosen = helpers.reference_independent_filtering(base_mean, p, alpha=0.05)
+    # Sorted p: 0.01, 0.03, 0.04, 0.5 -> scaled 0.04, 0.06, 0.0533, 0.5 -> running
+    # minimum from the top: 0.04, 0.0533, 0.0533, 0.5.
+    assert chosen == 0
+    np.testing.assert_allclose(
+        adjusted, [np.nan, 0.04, 0.16 / 3, 0.16 / 3, 0.5], rtol=1e-12
+    )
+
+
+def test_wald_reference_hand_worked():
+    """Two groups of two, no ridge: the sandwich is ``M^-1`` and the variance of the
+    group difference is ``1 / sum(W_A) + 1 / sum(W_B) = 1/2 + 1/3.2`` (W = 1 and 1.6
+    at mu 2 and 8 with disp 0.5)."""
+    x = np.column_stack([np.ones(4), [0.0, 0.0, 1.0, 1.0]])
+    beta = np.array([np.log(2.0), np.log(4.0)])
+    p, stat, se = helpers.wald_reference(
+        x, 0.5, beta, np.array([2.0, 2.0, 8.0, 8.0]), np.zeros((2, 2)), np.array([0, 1])
+    )
+    assert se == pytest.approx(np.sqrt(0.8125), rel=1e-12)
+    assert stat == pytest.approx(np.log(4.0) / np.sqrt(0.8125), rel=1e-12)
+    assert p == pytest.approx(2 * stats.norm.sf(stat), rel=1e-12)
+
+
+def test_bh_adjust_matches_scipy():
+    """Against ``scipy.stats.false_discovery_control`` (ties included); rounding only."""
+    rs = np.random.RandomState(0)
+    p = np.concatenate([rs.uniform(size=40), rs.uniform(0, 1e-4, size=10), [0.3, 0.3]])
+    np.testing.assert_allclose(
+        helpers.bh_adjust(p), stats.false_discovery_control(p, method="bh"), rtol=1e-12
+    )
+
+
+def test_apeglm_prior_var_solves_its_equation():
+    """The returned variance zeroes the estimating equation; null data give the floor."""
+    rs = np.random.RandomState(1)
+    se = rs.uniform(0.1, 0.5, size=200)
+    mle = rs.normal(scale=np.sqrt(0.8 + se**2))
+    a = helpers.apeglm_prior_var(mle, se)
+    w = 1 / (2 * (a + se**2) ** 2)
+    assert np.sum((mle**2 - se**2) * w) / np.sum(w) == pytest.approx(a, rel=1e-10)
+    assert 0.4 < a < 1.6  # the variance the MLEs were drawn with is 0.8
+    assert helpers.apeglm_prior_var(0.1 * mle, se) == 1e-6
+
+
+def test_apeglm_grad_hess_and_reference_map():
+    """The gradient and Hessian match central differences of the objective, and the
+    reference MAP is a stationary point with a positive definite Hessian."""
+    sim = helpers.simulate_counts(n_genes=3, n_samples=8, seed=2, frac_de=1.0)
+    x = sim.design_matrix.to_numpy()
+    offset = np.log(sim.size_factors.to_numpy())
+    for gene in sim.counts.columns:
+        y = sim.counts[gene].to_numpy()
+        args = (x, y, 1 / sim.dispersions[gene], offset, 1, 0.3)
+        beta = sim.beta.loc[gene].to_numpy() + 0.2
+        grad, hess = helpers.apeglm_grad_hess(beta, *args)
+        h = 1e-5
+        for k in range(2):
+            e = np.zeros(2)
+            e[k] = h
+            fd_grad = (
+                helpers.apeglm_objective(beta + e, *args)
+                - helpers.apeglm_objective(beta - e, *args)
+            ) / (2 * h)
+            fd_hess = (
+                helpers.apeglm_grad_hess(beta + e, *args)[0]
+                - helpers.apeglm_grad_hess(beta - e, *args)[0]
+            ) / (2 * h)
+            # Central differences: error ~h^2 times the third derivative, plus
+            # rounding of objective values near 100 divided by h (~1e-9).
+            assert fd_grad == pytest.approx(grad[k], rel=1e-5, abs=1e-6)
+            np.testing.assert_allclose(fd_hess, hess[:, k], rtol=1e-5, atol=1e-6)
+        best, _ = helpers.reference_map(*args, [beta])
+        g, hm = helpers.apeglm_grad_hess(best, *args)
+        assert np.max(np.abs(g)) < 1e-6
+        assert np.all(np.linalg.eigvalsh(hm) > 0)
+
+
+def test_reference_lowess_reproduces_a_line():
+    """One local linear fit of exactly linear data is the line (weighted least
+    squares on exact data: rounding only)."""
+    x = np.linspace(0.1, 0.95, 50)
+    y = 3.0 - 7.5 * x
+    for frac in (0.1, 0.5):
+        np.testing.assert_allclose(
+            helpers.reference_lowess(x, y, frac, iterations=1), y, rtol=1e-10
+        )
+
+
 def test_compare_fields_names_the_differences():
     genes = ["g1", "g2", "g3"]
     expected = pd.DataFrame({"a": [1.0, 2.0, np.nan], "b": [1.0, 1.0, 1.0]}, index=genes)

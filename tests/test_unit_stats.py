@@ -5,8 +5,8 @@
 ``DefaultInference``/``Inference`` methods behind them (see tests/TARGETS.md). Every
 expected value is computed here from the fitted ``DeseqDataSet``'s public fields
 (``obs``, ``var``, ``varm``, ``obsm``, ``layers``) with the references in
-``tests/test_unit_stats_functions.py``, so these tests check the testing and
-shrinkage steps whatever the precision of the fits before them.
+``tests/helpers.py``, so these tests check the testing and shrinkage steps whatever
+the precision of the fits before them.
 """
 
 import numpy as np
@@ -18,13 +18,7 @@ from pydeseq2.default_inference import DefaultInference
 from pydeseq2.ds import DeseqStats
 from pydeseq2.inference import Inference
 from tests import helpers
-from tests.test_unit_stats_functions import BIMODAL_SPREAD
 from tests.test_unit_stats_functions import SHRINK_ATOL
-from tests.test_unit_stats_functions import apeglm_prior_var
-from tests.test_unit_stats_functions import bh_adjust
-from tests.test_unit_stats_functions import reference_independent_filtering
-from tests.test_unit_stats_functions import reference_map
-from tests.test_unit_stats_functions import wald_reference
 
 pytestmark = helpers.PANDAS_DEPRECATION_FILTERS
 
@@ -236,7 +230,9 @@ def reference_wald(dds, contrast, ridge=None):
     for g in range(dds.n_vars):
         if np.isfinite(lfc[g]).all():
             mu = sf * np.exp(x @ lfc[g])
-            out[g] = wald_reference(x, disp[g], lfc[g], mu, ridge, np.asarray(contrast))
+            out[g] = helpers.wald_reference(
+                x, disp[g], lfc[g], mu, ridge, np.asarray(contrast)
+            )
     return pd.DataFrame(out, index=dds.var_names, columns=["pvalue", "stat", "se"])
 
 
@@ -500,7 +496,9 @@ def test_summary_results_table(dataset, request):
         res["pvalue"][keep], pvalues[keep], rtol=PVALUE_RTOL, name="pvalue"
     )
 
-    padj, _ = reference_independent_filtering(res["baseMean"], res["pvalue"], 0.05)
+    padj, _ = helpers.reference_independent_filtering(
+        res["baseMean"], res["pvalue"], 0.05
+    )
     # BH multiplies p-values by at most m / rank and takes running minima.
     helpers.assert_fields_close(res["padj"], padj, rtol=1e-10, name="padj")
 
@@ -511,7 +509,9 @@ def test_summary_independent_filtering_removes_low_counts(filtering):
     ds = _stats(filtering)
     ds.summary()
     res = ds.results_df
-    _, chosen = reference_independent_filtering(res["baseMean"], res["pvalue"], 0.05)
+    _, chosen = helpers.reference_independent_filtering(
+        res["baseMean"], res["pvalue"], 0.05
+    )
     assert chosen > 0
     filtered = res["padj"].isna() & res["pvalue"].notna()
     assert filtered.sum() >= 10
@@ -525,7 +525,9 @@ def test_summary_alpha_changes_the_filter(filtering, alpha):
     ds = _stats(filtering, alpha=alpha)
     ds.summary()
     res = ds.results_df
-    padj, _ = reference_independent_filtering(res["baseMean"], res["pvalue"], alpha)
+    padj, _ = helpers.reference_independent_filtering(
+        res["baseMean"], res["pvalue"], alpha
+    )
     helpers.assert_fields_close(res["padj"], padj, rtol=1e-10, name="padj")
 
 
@@ -536,7 +538,7 @@ def test_summary_without_independent_filtering_is_bh(dataset, request):
     ds.summary()
     p = ds.results_df["pvalue"]
     expected = pd.Series(np.nan, index=p.index)
-    expected[p.notna()] = bh_adjust(p[p.notna()].to_numpy())
+    expected[p.notna()] = helpers.bh_adjust(p[p.notna()].to_numpy())
     helpers.assert_fields_close(ds.results_df["padj"], expected, rtol=1e-12, name="padj")
 
 
@@ -763,7 +765,9 @@ def test_two_gene_dataset(n_cpus):
         ds.results_df["pvalue"], expected["pvalue"], rtol=PVALUE_RTOL
     )
     np.testing.assert_allclose(
-        ds.results_df["padj"], bh_adjust(ds.results_df["pvalue"].to_numpy()), rtol=1e-12
+        ds.results_df["padj"],
+        helpers.bh_adjust(ds.results_df["pvalue"].to_numpy()),
+        rtol=1e-12,
     )
     _assert_shrinkage_matches_reference(dds, ds, TWO_GROUP_COEFF, adapt=True)
 
@@ -772,7 +776,7 @@ def test_two_gene_dataset(n_cpus):
 
 
 def _starts(mle, k):
-    """Starts for reference_map: the MLE, and the MLE with the shrunk coefficient
+    """Starts for helpers.reference_map: the MLE, and the MLE with the shrunk coefficient
     at zero, inside the two basins a Cauchy prior can create."""
     at_zero = np.array(mle, dtype=float)
     at_zero[k] = 0.0
@@ -791,7 +795,7 @@ def _assert_shrinkage_matches_reference(dds, ds, coeff, adapt, max_bimodal=2):
     mle = ds.LFC.to_numpy().copy()
     finite = np.isfinite(mle[:, k])
     if adapt:
-        prior_var = apeglm_prior_var(mle[finite, k], ds.SE.to_numpy()[finite])
+        prior_var = helpers.apeglm_prior_var(mle[finite, k], ds.SE.to_numpy()[finite])
         scale = min(np.sqrt(prior_var), 1.0)
     else:
         scale = 1.0
@@ -809,8 +813,10 @@ def _assert_shrinkage_matches_reference(dds, ds, coeff, adapt, max_bimodal=2):
     n_bimodal = 0
     for g in np.flatnonzero(finite):
         y = np.asarray(dds.X[:, g], dtype=float)
-        ref, spread = reference_map(x, y, size[g], offset, k, scale, _starts(mle[g], k))
-        if spread > BIMODAL_SPREAD:
+        ref, spread = helpers.reference_map(
+            x, y, size[g], offset, k, scale, _starts(mle[g], k)
+        )
+        if spread > helpers.BIMODAL_SPREAD:
             n_bimodal += 1
             continue
         assert abs(shrunk[g] - ref[k]) <= SHRINK_ATOL, (
@@ -925,10 +931,10 @@ def test_inference_lfc_shrink_gene_subsets(two_group, n_cpus):
         )
         for g, beta in zip(genes, part[0], strict=True):
             start = [np.log(counts[:, g].mean() + 0.5), 0.0]
-            ref, spread = reference_map(
+            ref, spread = helpers.reference_map(
                 x, counts[:, g], size[g], offset, 1, 0.5, _starts(start, 1)
             )
-            assert spread < BIMODAL_SPREAD
+            assert spread < helpers.BIMODAL_SPREAD
             np.testing.assert_allclose(beta, ref, rtol=0, atol=SHRINK_ATOL)
 
 

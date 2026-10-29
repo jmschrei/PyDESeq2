@@ -2,23 +2,12 @@
 
 ``glm.wald_test``, ``distributions.nbinomFn``, ``distributions.nbinomGLM``,
 ``grid_search.grid_fit_shrink_beta`` and ``stats.lowess``, each against a reference
-written in this module. ``tests/test_unit_stats.py`` imports the references for the
-``DeseqStats`` tests:
-
-- :func:`wald_reference`: DESeq2's Wald test (sandwich covariance with a ridge).
-- :func:`apeglm_objective`, :func:`apeglm_grad_hess`, :func:`reference_map`: apeglm's
-  negative log posterior (NB likelihood from ``helpers.nb_loglik``, normal prior on
-  the coefficients that are not shrunk, Cauchy prior on the one that is) and its
-  minimizer by trust-region Newton from several starts.
-- :func:`apeglm_prior_var`: apeglm's adaptive prior variance.
-- :func:`bh_adjust`, :func:`reference_lowess`, :func:`reference_independent_filtering`:
-  Benjamini-Hochberg by hand, Cleveland's robust lowess and DESeq2's independent
-  filtering (``pvalueAdjustment`` in DESeq2's ``results.R``).
+in ``tests/helpers.py``: DESeq2's Wald test (sandwich covariance with a ridge),
+apeglm's negative log posterior and its minimizer, and Cleveland's robust lowess.
 """
 
 import numpy as np
 import pytest
-from scipy import optimize
 from scipy import stats
 
 from pydeseq2 import glm
@@ -31,191 +20,15 @@ from tests import helpers
 pytestmark = helpers.PANDAS_DEPRECATION_FILTERS
 
 # nbinomGLM stops L-BFGS-B at ftol=gtol=1e-8 on the objective divided by its value
-# at beta = 0. Against reference_map that left absolute errors up to 3.5e-3 on the
+# at beta = 0. Against helpers.reference_map that left absolute errors up to 3.5e-3 on the
 # shrunk natural-log coefficient (6.4e-3 on any coefficient) and relative objective
 # gaps up to 8.5e-6, over 820 simulated genes (2 to 5 coefficients, 6 to 18
 # samples, adaptive and unit prior scales). The tolerances below leave a 3x margin
 # on the coefficients and 10x on the objective. They hold for dispersions well above
-# 1e-6; below that L-BFGS-B stops early
-# (known-bugs/D-shrink-near-poisson-stops-early.md).
+# 1e-6; at 1e-6 and below L-BFGS-B stops far from the minimum on the scaled
+# objective and still reports success, so no test uses such dispersions.
 SHRINK_ATOL = 2e-2
 SHRINK_OBJECTIVE_RTOL = 1e-4
-
-# Two starts of reference_map that end further apart than this mean the posterior
-# has two local minima; such genes are left out of coefficient comparisons.
-BIMODAL_SPREAD = 1e-3
-
-
-# References
-
-
-def wald_reference(x, disp, beta, mu, ridge, contrast, lfc_null=0.0):
-    """DESeq2's Wald test for one gene, without alternative hypotheses.
-
-    The covariance of the ridge-penalized estimate is the sandwich
-    ``(M + R)^-1 M (M + R)^-1`` with ``M = X^T W X`` and ``W = mu / (1 + disp mu)``.
-    Returns ``(p_value, statistic, se)``.
-    """
-    w = mu / (1.0 + disp * mu)
-    m = (x.T * w) @ x
-    hc = np.linalg.solve(m + ridge, contrast)
-    se = np.sqrt(hc @ m @ hc)
-    stat = (contrast @ beta - lfc_null) / se
-    return 2 * stats.norm.sf(abs(stat)), stat, se
-
-
-def apeglm_objective(beta, x, counts, size, offset, shrink_index, prior_scale):
-    """apeglm's negative log posterior, up to a constant in ``beta``.
-
-    NB likelihood with mean ``exp(x @ beta + offset)`` and dispersion ``1 / size``,
-    a N(0, 15^2) prior on every coefficient but ``shrink_index``, and a Cauchy prior
-    of scale ``prior_scale`` on that one (``log1p((b / s)^2)`` up to a constant).
-    """
-    beta = np.asarray(beta, dtype=float)
-    mu = np.exp(x @ beta + offset)
-    nll = -helpers.nb_loglik(counts, mu, 1.0 / size)
-    others = np.delete(beta, shrink_index)
-    return (
-        nll
-        + np.sum(others**2) / (2 * 15.0**2)
-        + np.log1p((beta[shrink_index] / prior_scale) ** 2)
-    )
-
-
-def apeglm_grad_hess(beta, x, counts, size, offset, shrink_index, prior_scale):
-    """Gradient and Hessian of :func:`apeglm_objective`."""
-    mu = np.exp(x @ beta + offset)
-    grad = x.T @ (size * (mu - counts) / (size + mu))
-    hess = (x.T * (size * mu * (size + counts) / (size + mu) ** 2)) @ x
-    prior_grad = beta / 15.0**2
-    prior_curv = np.full(beta.size, 1 / 15.0**2)
-    b, s2 = beta[shrink_index], prior_scale**2
-    prior_grad[shrink_index] = 2 * b / (s2 + b**2)
-    prior_curv[shrink_index] = 2 * (s2 - b**2) / (s2 + b**2) ** 2
-    return grad + prior_grad, hess + np.diag(prior_curv)
-
-
-def reference_map(x, counts, size, offset, shrink_index, prior_scale, starts):
-    """Minimize :func:`apeglm_objective` by trust-region Newton from each start.
-
-    Returns the lowest minimum found and the largest distance from it to the other
-    starts' minima: a spread above ``BIMODAL_SPREAD`` means two local minima.
-    """
-    args = (x, counts, size, offset, shrink_index, prior_scale)
-    fits = [
-        optimize.minimize(
-            apeglm_objective,
-            np.asarray(start, dtype=float),
-            args=args,
-            jac=lambda b, *a: apeglm_grad_hess(b, *a)[0],
-            hess=lambda b, *a: apeglm_grad_hess(b, *a)[1],
-            method="trust-exact",
-            options={"gtol": 1e-9, "maxiter": 1000},
-        )
-        for start in starts
-    ]
-    best = min(fits, key=lambda fit: fit.fun)
-    spread = max(np.max(np.abs(fit.x - best.x)) for fit in fits)
-    return best.x, spread
-
-
-def apeglm_prior_var(mle, se, min_var=1e-6, max_var=400.0):
-    """apeglm's ``priorVar``: the zero of its estimating equation, or ``min_var``.
-
-    ``mle`` and ``se`` are the unshrunk coefficients and their standard errors
-    (natural log); the equation is
-    ``sum((mle^2 - se^2) w) / sum(w) = a`` with ``w = 1 / (2 (a + se^2)^2)``.
-    """
-    s2, d2 = np.asarray(mle) ** 2, np.asarray(se) ** 2
-
-    def excess(a):
-        w = 1 / (2 * (a + d2) ** 2)
-        return np.sum((s2 - d2) * w) / np.sum(w) - a
-
-    if excess(min_var) < 0:
-        return min_var
-    return optimize.brentq(excess, min_var, max_var, xtol=1e-15, rtol=1e-14)
-
-
-def bh_adjust(p):
-    """Benjamini-Hochberg adjusted p-values, by hand (no NaN allowed)."""
-    p = np.asarray(p, dtype=float)
-    m = p.size
-    order = np.argsort(p, kind="stable")
-    scaled = p[order] * m / np.arange(1, m + 1)
-    adjusted = np.minimum.accumulate(scaled[::-1])[::-1]
-    out = np.empty(m)
-    out[order] = np.minimum(adjusted, 1.0)
-    return out
-
-
-def reference_lowess(x, y, frac, iterations):
-    """Cleveland's robust locally weighted linear regression.
-
-    The fit at ``x[i]`` is a weighted least-squares line with tricube weights over
-    the distance to ``x[i]`` divided by the ``r``-th smallest such distance,
-    ``r = ceil(frac * n)`` (counting the zero distance to ``x[i]`` itself, as in
-    Biopython's ``lowess``, which ``pydeseq2.stats.lowess`` follows). ``iterations``
-    fits are made; each after the first multiplies the weights by the bisquare of the
-    previous residuals over six times their median absolute value (weight 1 for zero
-    residuals and 0 otherwise when that median is zero).
-    """
-    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
-    n = x.size
-    r = int(np.ceil(frac * n))
-    dist = np.abs(x[:, None] - x[None, :])
-    bandwidth = np.maximum(np.sort(dist, axis=1)[:, r], 1e-12)
-    local = (1 - np.clip(dist / bandwidth[:, None], 0.0, 1.0) ** 3) ** 3
-    robust = np.ones(n)
-    fit = np.empty(n)
-    for _ in range(iterations):
-        for i in range(n):
-            w = local[i] * robust
-            xm, ym = np.sum(w * x) / np.sum(w), np.sum(w * y) / np.sum(w)
-            sxx = np.sum(w * (x - xm) ** 2)
-            slope = np.sum(w * (x - xm) * (y - ym)) / sxx if sxx > 0 else 0.0
-            fit[i] = ym + slope * (x[i] - xm)
-        resid = y - fit
-        s = np.median(np.abs(resid))
-        if s == 0:
-            robust = (resid == 0).astype(float)
-        else:
-            robust = (1 - np.clip(resid / (6 * s), -1, 1) ** 2) ** 2
-    return fit
-
-
-def reference_independent_filtering(base_mean, pvalues, alpha):
-    """DESeq2's independent filtering on the mean of normalized counts.
-
-    For 50 quantiles ``theta`` of ``base_mean`` from the fraction of zeros to 0.95,
-    BH-adjust the p-values of the genes at or above the quantile; count rejections at
-    ``alpha``; smooth the counts with lowess (``frac=1/5``); pick the first ``theta``
-    whose count exceeds the smooth's maximum minus the root mean square residual of
-    the non-zero counts (the first ``theta`` when no count exceeds 10).
-
-    Returns the adjusted p-values (NaN for filtered genes) and the chosen index.
-    """
-    base_mean = np.asarray(base_mean, dtype=float)
-    pvalues = np.asarray(pvalues, dtype=float)
-    lower = np.mean(base_mean == 0)
-    theta = np.linspace(lower, 0.95 if lower < 0.95 else 1.0, 50)
-    cutoffs = np.quantile(base_mean, theta)
-    adjusted = np.full((theta.size, base_mean.size), np.nan)
-    for i, cutoff in enumerate(cutoffs):
-        use = (base_mean >= cutoff) & ~np.isnan(pvalues)
-        if use.any():
-            adjusted[i, use] = bh_adjust(pvalues[use])
-    with np.errstate(invalid="ignore"):
-        num_rej = np.sum(adjusted < alpha, axis=1)
-    smooth = reference_lowess(theta, num_rej, frac=1 / 5, iterations=3)
-    chosen = 0
-    if num_rej.max() > 10:
-        positive = num_rej > 0
-        resid = num_rej[positive] - smooth[positive]
-        thresh = smooth.max() - np.sqrt(np.mean(resid**2))
-        above = np.flatnonzero(num_rej > thresh)
-        chosen = int(above[0]) if above.size else 0
-    return adjusted[chosen], chosen
 
 
 def _two_group_design(n_per_group):
@@ -257,7 +70,7 @@ def test_wald_test_two_groups_hand_worked():
 
 @pytest.mark.parametrize("design", ["two_group", "five_coefficients"])
 def test_wald_test_matches_sandwich_formula(design):
-    """Random genes against :func:`wald_reference`, with the default and a large ridge.
+    """Random genes against :func:`helpers.wald_reference`, with the default and a large ridge.
 
     The two computations differ only in rounding (inverse versus solve, order of
     products); 1e-9 relative on SE and statistic covers condition numbers up to 1e6.
@@ -293,7 +106,7 @@ def test_wald_test_matches_sandwich_formula(design):
                 lfc_null=0.0,
                 alt_hypothesis=None,
             )
-            expected = wald_reference(x, disp, beta, mu, ridge, contrast)
+            expected = helpers.wald_reference(x, disp, beta, mu, ridge, contrast)
             assert actual[2] == pytest.approx(expected[2], rel=1e-9)
             assert actual[1] == pytest.approx(expected[1], rel=1e-9)
             assert actual[0] == pytest.approx(expected[0], rel=1e-7)
@@ -331,7 +144,7 @@ def test_wald_test_alternative_hypotheses(alt, threshold, lfc):
     mu = np.exp(x @ beta)
     ridge = np.diag([1e-6, 1e-6])
     contrast = np.array([0.0, 1.0])
-    _, _, s = wald_reference(x, 0.2, beta, mu, ridge, contrast)
+    _, _, s = helpers.wald_reference(x, 0.2, beta, mu, ridge, contrast)
     t, b = threshold, lfc
     if alt == "greaterAbs":
         stat = np.sign(b) * max((abs(b) - t) / s, 0.0)
@@ -395,7 +208,7 @@ def test_nbinomFn_matches_likelihood_and_prior(shrink_index):
                 nbinomFn(b, x, y, size, offset, 15.0, scale, shrink_index) for b in betas
             ]
             expected = [
-                apeglm_objective(b, x, y, size, offset, shrink_index, scale)
+                helpers.apeglm_objective(b, x, y, size, offset, shrink_index, scale)
                 for b in betas
             ]
             size_of_objective = max(abs(v) for v in expected)
@@ -423,7 +236,7 @@ def _map_cases():
 
 @pytest.mark.parametrize("prior_scale", [0.2, 1.0])
 def test_nbinomGLM_matches_reference_map(prior_scale):
-    """MAP coefficients against :func:`reference_map`, gene by gene.
+    """MAP coefficients against :func:`helpers.reference_map`, gene by gene.
 
     Uses the true dispersions and size factors, so the inputs are what nbinomGLM
     documents and nothing else is under test. ``converged`` must be True; genes with
@@ -439,7 +252,7 @@ def test_nbinomGLM_matches_reference_map(prior_scale):
             beta, _, converged = nbinomGLM(
                 x, y, size, offset, 15.0, prior_scale, shrink_index=shrink_index
             )
-            ref, spread = reference_map(
+            ref, spread = helpers.reference_map(
                 x,
                 y,
                 size,
@@ -449,12 +262,12 @@ def test_nbinomGLM_matches_reference_map(prior_scale):
                 [sim.beta.loc[gene].to_numpy(), np.zeros(x.shape[1])],
             )
             assert converged, gene
-            if spread > BIMODAL_SPREAD:
+            if spread > helpers.BIMODAL_SPREAD:
                 n_bimodal += 1
                 continue
             args = (x, y, size, offset, shrink_index, prior_scale)
-            f_ref = apeglm_objective(ref, *args)
-            gap = (apeglm_objective(beta, *args) - f_ref) / abs(f_ref)
+            f_ref = helpers.apeglm_objective(ref, *args)
+            gap = (helpers.apeglm_objective(beta, *args) - f_ref) / abs(f_ref)
             assert gap <= SHRINK_OBJECTIVE_RTOL, (gene, shrink_index, gap)
             np.testing.assert_allclose(beta, ref, rtol=0, atol=SHRINK_ATOL, err_msg=gene)
     assert n_bimodal <= 2
@@ -481,7 +294,7 @@ def test_nbinomGLM_inverse_hessian_under_a_weak_prior():
         size = 1.0 / sim.dispersions[gene]
         beta, inv_hessian, converged = nbinomGLM(x, y, size, offset, 15.0, 10.0)
         assert converged
-        _, hess = apeglm_grad_hess(beta, x, y, size, offset, 1, 10.0)
+        _, hess = helpers.apeglm_grad_hess(beta, x, y, size, offset, 1, 10.0)
         likelihood_curv = hess - np.diag([1 / 225, 0.0])
         likelihood_curv[1, 1] -= 2 * (100 - beta[1] ** 2) / (100 + beta[1] ** 2) ** 2
         assert 0.02 < 1e-3 * np.diag(likelihood_curv).min()
@@ -512,14 +325,16 @@ def test_nbinomGLM_genes_with_zero_group():
         for scale in (0.1, 1.0):
             beta, _, converged = nbinomGLM(x, y, size, offset, 15.0, scale)
             far = np.array([0.0, 5.0 * np.sign(y[4] - y[0])])
-            ref, spread = reference_map(x, y, size, offset, 1, scale, [np.zeros(2), far])
+            ref, spread = helpers.reference_map(
+                x, y, size, offset, 1, scale, [np.zeros(2), far]
+            )
             assert converged
-            if spread > BIMODAL_SPREAD:
+            if spread > helpers.BIMODAL_SPREAD:
                 continue
             n_compared += 1
             args = (x, y, size, offset, 1, scale)
-            f_ref = apeglm_objective(ref, *args)
-            assert (apeglm_objective(beta, *args) - f_ref) / abs(
+            f_ref = helpers.apeglm_objective(ref, *args)
+            assert (helpers.apeglm_objective(beta, *args) - f_ref) / abs(
                 f_ref
             ) <= SHRINK_OBJECTIVE_RTOL
             assert np.sign(beta[1]) == np.sign(ref[1])
@@ -531,7 +346,7 @@ def test_nbinomGLM_genes_with_zero_group():
 
 
 def test_grid_fit_shrink_beta_matches_reference():
-    """The 2D grid minimum against :func:`reference_map`.
+    """The 2D grid minimum against :func:`helpers.reference_map`.
 
     The coarse grid has 60 points over [-30, 30] (step 60/59); the fine grid has 60
     points over two coarse steps around the coarse minimum (step 2 (60/59) / 59, about
@@ -548,16 +363,16 @@ def test_grid_fit_shrink_beta_matches_reference():
         size = 1.0 / sim.dispersions[gene]
         scale_cnst = max(nbinomFn(np.zeros(2), x, y, size, offset, 15.0, 0.5), 1.0)
         beta = grid_fit_shrink_beta(y, offset, x, size, 15.0, 0.5, scale_cnst)
-        ref, spread = reference_map(
+        ref, spread = helpers.reference_map(
             x, y, size, offset, 1, 0.5, [sim.beta.loc[gene].to_numpy(), np.zeros(2)]
         )
-        assert spread < BIMODAL_SPREAD
+        assert spread < helpers.BIMODAL_SPREAD
         np.testing.assert_allclose(beta, ref, rtol=0, atol=2 * fine_step, err_msg=gene)
-        _, hess = apeglm_grad_hess(ref, x, y, size, offset, 1, 0.5)
+        _, hess = helpers.apeglm_grad_hess(ref, x, y, size, offset, 1, 0.5)
         args = (x, y, size, offset, 1, 0.5)
         step = np.full(2, fine_step)
         assert (
-            apeglm_objective(beta, *args) - apeglm_objective(ref, *args)
+            helpers.apeglm_objective(beta, *args) - helpers.apeglm_objective(ref, *args)
             <= step @ hess @ step
         )
 
@@ -581,7 +396,7 @@ def test_lowess_reproduces_a_line():
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_lowess_matches_reference(seed):
-    """Noisy curves with a few gross outliers against :func:`reference_lowess`.
+    """Noisy curves with a few gross outliers against :func:`helpers.reference_lowess`.
 
     The two solve the same weighted least-squares problems in different
     arrangements (normal equations versus centred sums), which differ by rounding;
@@ -594,25 +409,7 @@ def test_lowess_matches_reference(seed):
     for frac, iterations in [(1 / 5, 3), (0.5, 2)]:
         np.testing.assert_allclose(
             lowess(x, y, frac=frac, iter=iterations),
-            reference_lowess(x, y, frac, iterations),
+            helpers.reference_lowess(x, y, frac, iterations),
             rtol=0,
             atol=1e-8 * np.ptp(y),
         )
-
-
-def test_reference_independent_filtering_hand_worked():
-    """Self-test of :func:`reference_independent_filtering` on a small worked case.
-
-    With no more than 10 rejections at any quantile the first quantile is chosen,
-    which keeps every gene with a non-zero mean; the adjusted p-values are then BH
-    over those genes (worked below).
-    """
-    base_mean = np.array([0.0, 5.0, 10.0, 20.0, 40.0])
-    p = np.array([np.nan, 0.01, 0.04, 0.03, 0.5])
-    adjusted, chosen = reference_independent_filtering(base_mean, p, alpha=0.05)
-    # Sorted p: 0.01, 0.03, 0.04, 0.5 -> scaled 0.04, 0.06, 0.0533, 0.5 -> running
-    # minimum from the top: 0.04, 0.0533, 0.0533, 0.5.
-    assert chosen == 0
-    np.testing.assert_allclose(
-        adjusted, [np.nan, 0.04, 0.16 / 3, 0.16 / 3, 0.5], rtol=1e-12
-    )

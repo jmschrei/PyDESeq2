@@ -15,6 +15,15 @@ Contents:
   adjusted dispersion objective and its minimizer by grid plus bounded Brent search.
 - :func:`glm_objective`, :func:`reference_glm_mle`: the ridge-penalized NB GLM
   objective and its minimizer by Newton's method.
+- :func:`wald_reference`: DESeq2's Wald test (sandwich covariance with a ridge).
+- :func:`apeglm_objective`, :func:`apeglm_grad_hess`, :func:`reference_map`:
+  apeglm's negative log posterior (NB likelihood, normal prior on the coefficients
+  that are not shrunk, Cauchy prior on the one that is) and its minimizer by
+  trust-region Newton from several starts; :func:`apeglm_prior_var`, apeglm's
+  adaptive prior variance.
+- :func:`bh_adjust`, :func:`reference_lowess`, :func:`reference_independent_filtering`:
+  Benjamini-Hochberg by hand, Cleveland's robust lowess and DESeq2's independent
+  filtering (``pvalueAdjustment`` in DESeq2's ``results.R``).
 - :func:`compare_fields`, :func:`assert_fields_close`: tolerance comparison that
   names the genes and fields that differ.
 """
@@ -28,6 +37,7 @@ import pytest
 from formulaic import model_matrix
 from scipy import optimize
 from scipy import special
+from scipy import stats
 
 from pydeseq2.dds import DeseqDataSet
 
@@ -570,10 +580,16 @@ def reference_glm_mle(
     The objective is strictly convex in beta (its Hessian is
     ``X^T diag(mu (1 + alpha y) / (1 + alpha mu)^2) X + ridge I``), so Newton's
     method from a least-squares start reaches the unique minimizer. Stops after the
-    first Newton step below 1e-10 in every coordinate; Newton converges
-    quadratically, so the error left after that step is at the level of rounding.
-    Raises if that does not happen in ``max_iter`` steps.
+    first Newton step that is, in every coordinate, below 1e-10 or within 64 times
+    the step's rounding error (the gradient's rounding error mapped through the
+    inverse Hessian); Newton converges quadratically, so the error left after that
+    step is at the level of rounding. Steps are halved only while the objective
+    rises by more than 64 times its own rounding error: with counts near 1e7 the
+    terms of the log-likelihood reach 1e8 and the objective cannot resolve the last
+    steps, which are then taken in full. Raises if no step meets the stop rule in
+    ``max_iter`` steps.
     """
+    eps = np.finfo(float).eps
     y = np.asarray(counts, dtype=float)
     sf = np.asarray(size_factors, dtype=float)
     x = np.asarray(design_matrix, dtype=float)
@@ -586,14 +602,209 @@ def reference_glm_mle(
         weights = mu * (1.0 + disp * y) / (1.0 + disp * mu) ** 2
         hess = (x.T * weights) @ x + ridge * eye
         step = np.linalg.solve(hess, grad)
-        if np.max(np.abs(step)) < 1e-10:
+        grad_rounding = eps * (
+            np.abs(x).T @ ((y + mu) / (1.0 + disp * mu)) + ridge * np.abs(beta)
+        )
+        step_rounding = np.abs(np.linalg.inv(hess)) @ grad_rounding
+        if np.all(np.abs(step) <= np.maximum(1e-10, 64 * step_rounding)):
             return beta - step
-        # Halve the step while it increases the objective by more than rounding.
         f0, t = objective(beta), 1.0
-        while objective(beta - t * step) > f0 + 1e-12 * abs(f0) and t > 1e-12:
+        f_rounding = 64 * eps * _glm_objective_magnitude(y, mu, disp, beta, ridge)
+        while objective(beta - t * step) > f0 + f_rounding and t > 1e-12:
             t /= 2
         beta = beta - t * step
     raise RuntimeError("reference_glm_mle did not converge.")
+
+
+def _glm_objective_magnitude(y, mu, disp, beta, ridge):
+    # Sum of the absolute values of the terms glm_objective adds up (see nb_logpmf):
+    # the objective's rounding error is about machine epsilon times this.
+    log1p_am = np.log1p(disp * mu)
+    positive = y > 0
+    y_safe = np.where(positive, y, 1.0)
+    log_comb = np.where(
+        positive, np.log(y_safe) + np.abs(special.betaln(1.0 / disp, y_safe)), 0.0
+    )
+    terms = (
+        log_comb + log1p_am / disp + np.abs(special.xlogy(y, disp * mu)) + y * log1p_am
+    )
+    return float(terms.sum() + 0.5 * ridge * np.sum(beta**2))
+
+
+# References for testing and shrinkage
+
+# Two starts of reference_map that end further apart than this mean the posterior
+# has two local minima; such genes are left out of coefficient comparisons.
+BIMODAL_SPREAD = 1e-3
+
+
+def wald_reference(x, disp, beta, mu, ridge, contrast, lfc_null=0.0):
+    """DESeq2's Wald test for one gene, without alternative hypotheses.
+
+    The covariance of the ridge-penalized estimate is the sandwich
+    ``(M + R)^-1 M (M + R)^-1`` with ``M = X^T W X`` and ``W = mu / (1 + disp mu)``.
+    Returns ``(p_value, statistic, se)``.
+    """
+    w = mu / (1.0 + disp * mu)
+    m = (x.T * w) @ x
+    hc = np.linalg.solve(m + ridge, contrast)
+    se = np.sqrt(hc @ m @ hc)
+    stat = (contrast @ beta - lfc_null) / se
+    return 2 * stats.norm.sf(abs(stat)), stat, se
+
+
+def apeglm_objective(beta, x, counts, size, offset, shrink_index, prior_scale):
+    """apeglm's negative log posterior, up to a constant in ``beta``.
+
+    NB likelihood with mean ``exp(x @ beta + offset)`` and dispersion ``1 / size``,
+    a N(0, 15^2) prior on every coefficient but ``shrink_index``, and a Cauchy prior
+    of scale ``prior_scale`` on that one (``log1p((b / s)^2)`` up to a constant).
+    """
+    beta = np.asarray(beta, dtype=float)
+    mu = np.exp(x @ beta + offset)
+    nll = -nb_loglik(counts, mu, 1.0 / size)
+    others = np.delete(beta, shrink_index)
+    return (
+        nll
+        + np.sum(others**2) / (2 * 15.0**2)
+        + np.log1p((beta[shrink_index] / prior_scale) ** 2)
+    )
+
+
+def apeglm_grad_hess(beta, x, counts, size, offset, shrink_index, prior_scale):
+    """Gradient and Hessian of :func:`apeglm_objective`."""
+    mu = np.exp(x @ beta + offset)
+    grad = x.T @ (size * (mu - counts) / (size + mu))
+    hess = (x.T * (size * mu * (size + counts) / (size + mu) ** 2)) @ x
+    prior_grad = beta / 15.0**2
+    prior_curv = np.full(beta.size, 1 / 15.0**2)
+    b, s2 = beta[shrink_index], prior_scale**2
+    prior_grad[shrink_index] = 2 * b / (s2 + b**2)
+    prior_curv[shrink_index] = 2 * (s2 - b**2) / (s2 + b**2) ** 2
+    return grad + prior_grad, hess + np.diag(prior_curv)
+
+
+def reference_map(x, counts, size, offset, shrink_index, prior_scale, starts):
+    """Minimize :func:`apeglm_objective` by trust-region Newton from each start.
+
+    Returns the lowest minimum found and the largest distance from it to the other
+    starts' minima: a spread above ``BIMODAL_SPREAD`` means two local minima.
+    """
+    args = (x, counts, size, offset, shrink_index, prior_scale)
+    fits = [
+        optimize.minimize(
+            apeglm_objective,
+            np.asarray(start, dtype=float),
+            args=args,
+            jac=lambda b, *a: apeglm_grad_hess(b, *a)[0],
+            hess=lambda b, *a: apeglm_grad_hess(b, *a)[1],
+            method="trust-exact",
+            options={"gtol": 1e-9, "maxiter": 1000},
+        )
+        for start in starts
+    ]
+    best = min(fits, key=lambda fit: fit.fun)
+    spread = max(np.max(np.abs(fit.x - best.x)) for fit in fits)
+    return best.x, spread
+
+
+def apeglm_prior_var(mle, se, min_var=1e-6, max_var=400.0):
+    """apeglm's ``priorVar``: the zero of its estimating equation, or ``min_var``.
+
+    ``mle`` and ``se`` are the unshrunk coefficients and their standard errors
+    (natural log); the equation is
+    ``sum((mle^2 - se^2) w) / sum(w) = a`` with ``w = 1 / (2 (a + se^2)^2)``.
+    """
+    s2, d2 = np.asarray(mle) ** 2, np.asarray(se) ** 2
+
+    def excess(a):
+        w = 1 / (2 * (a + d2) ** 2)
+        return np.sum((s2 - d2) * w) / np.sum(w) - a
+
+    if excess(min_var) < 0:
+        return min_var
+    return optimize.brentq(excess, min_var, max_var, xtol=1e-15, rtol=1e-14)
+
+
+def bh_adjust(p):
+    """Benjamini-Hochberg adjusted p-values, by hand (no NaN allowed)."""
+    p = np.asarray(p, dtype=float)
+    m = p.size
+    order = np.argsort(p, kind="stable")
+    scaled = p[order] * m / np.arange(1, m + 1)
+    adjusted = np.minimum.accumulate(scaled[::-1])[::-1]
+    out = np.empty(m)
+    out[order] = np.minimum(adjusted, 1.0)
+    return out
+
+
+def reference_lowess(x, y, frac, iterations):
+    """Cleveland's robust locally weighted linear regression.
+
+    The fit at ``x[i]`` is a weighted least-squares line with tricube weights over
+    the distance to ``x[i]`` divided by the ``r``-th smallest such distance,
+    ``r = ceil(frac * n)`` (counting the zero distance to ``x[i]`` itself, as in
+    Biopython's ``lowess``, which ``pydeseq2.stats.lowess`` follows). ``iterations``
+    fits are made; each after the first multiplies the weights by the bisquare of the
+    previous residuals over six times their median absolute value (weight 1 for zero
+    residuals and 0 otherwise when that median is zero).
+    """
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    n = x.size
+    r = int(np.ceil(frac * n))
+    dist = np.abs(x[:, None] - x[None, :])
+    bandwidth = np.maximum(np.sort(dist, axis=1)[:, r], 1e-12)
+    local = (1 - np.clip(dist / bandwidth[:, None], 0.0, 1.0) ** 3) ** 3
+    robust = np.ones(n)
+    fit = np.empty(n)
+    for _ in range(iterations):
+        for i in range(n):
+            w = local[i] * robust
+            xm, ym = np.sum(w * x) / np.sum(w), np.sum(w * y) / np.sum(w)
+            sxx = np.sum(w * (x - xm) ** 2)
+            slope = np.sum(w * (x - xm) * (y - ym)) / sxx if sxx > 0 else 0.0
+            fit[i] = ym + slope * (x[i] - xm)
+        resid = y - fit
+        s = np.median(np.abs(resid))
+        if s == 0:
+            robust = (resid == 0).astype(float)
+        else:
+            robust = (1 - np.clip(resid / (6 * s), -1, 1) ** 2) ** 2
+    return fit
+
+
+def reference_independent_filtering(base_mean, pvalues, alpha):
+    """DESeq2's independent filtering on the mean of normalized counts.
+
+    For 50 quantiles ``theta`` of ``base_mean`` from the fraction of zeros to 0.95,
+    BH-adjust the p-values of the genes at or above the quantile; count rejections at
+    ``alpha``; smooth the counts with lowess (``frac=1/5``); pick the first ``theta``
+    whose count exceeds the smooth's maximum minus the root mean square residual of
+    the non-zero counts (the first ``theta`` when no count exceeds 10).
+
+    Returns the adjusted p-values (NaN for filtered genes) and the chosen index.
+    """
+    base_mean = np.asarray(base_mean, dtype=float)
+    pvalues = np.asarray(pvalues, dtype=float)
+    lower = np.mean(base_mean == 0)
+    theta = np.linspace(lower, 0.95 if lower < 0.95 else 1.0, 50)
+    cutoffs = np.quantile(base_mean, theta)
+    adjusted = np.full((theta.size, base_mean.size), np.nan)
+    for i, cutoff in enumerate(cutoffs):
+        use = (base_mean >= cutoff) & ~np.isnan(pvalues)
+        if use.any():
+            adjusted[i, use] = bh_adjust(pvalues[use])
+    with np.errstate(invalid="ignore"):
+        num_rej = np.sum(adjusted < alpha, axis=1)
+    smooth = reference_lowess(theta, num_rej, frac=1 / 5, iterations=3)
+    chosen = 0
+    if num_rej.max() > 10:
+        positive = num_rej > 0
+        resid = num_rej[positive] - smooth[positive]
+        thresh = smooth.max() - np.sqrt(np.mean(resid**2))
+        above = np.flatnonzero(num_rej > thresh)
+        chosen = int(above[0]) if above.size else 0
+    return adjusted[chosen], chosen
 
 
 # Comparison

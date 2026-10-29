@@ -173,45 +173,16 @@ def _starts_at_min_disp(y, sf, groups, n_coefs, min_disp=1e-8):
     return min(max(rough, 0.0), moments) <= min_disp
 
 
-def _reference_lfc(y, sf, x, disp):
-    """``helpers.reference_glm_mle``, with a looser stop for very large counts.
-
-    With counts near 1e7 (or an outlier of 3e5) the rounding of the gradient keeps
-    Newton's steps near 2e-6 (5e-10), above the helper's 1e-10 stop, and it raises;
-    which genes do depends on the numpy build. The same Newton iteration then stops
-    at a step below 1e-5: the Newton step approximates the remaining distance to the
-    minimizer, so that is 100 times below LFC_ATOL.
-    """
-    try:
-        return helpers.reference_glm_mle(y, sf, x, disp)
-    except RuntimeError:
-        pass
-    y = np.asarray(y, dtype=float)
-    objective = helpers.glm_objective(y, sf, x, disp)
-    beta = np.linalg.lstsq(x, np.log(y / sf + 0.1), rcond=None)[0]
-    for _ in range(100):
-        mu = sf * np.exp(x @ beta)
-        grad = -x.T @ ((y - mu) / (1.0 + disp * mu)) + RIDGE * beta
-        weights = mu * (1.0 + disp * y) / (1.0 + disp * mu) ** 2
-        step = np.linalg.solve((x.T * weights) @ x + RIDGE * np.eye(x.shape[1]), grad)
-        if np.max(np.abs(step)) < 1e-5:
-            return beta - step
-        t = 1.0
-        while objective(beta - t * step) > objective(beta) and t > 1e-12:
-            t /= 2
-        beta = beta - t * step
-    raise RuntimeError("reference Newton did not converge")
-
-
 def _lfc_reference_or_none(y, sf, x, disp):
-    """``_reference_lfc``, or None where IRLS's ``min_mu`` floor changes the fit.
+    """``helpers.reference_glm_mle``, or None where IRLS's ``min_mu`` floor changes the
+    fit.
 
     A fitted mean below ``min_mu`` moves IRLS's fixed point away from the minimizer
     (README_NEW_TESTS.md); a factor of 2 margin keeps genes clear of the floor.
     """
     if (y == 0).all() or _has_all_zero_group(y, x):
         return None
-    beta = _reference_lfc(y, sf, x, disp)
+    beta = helpers.reference_glm_mle(y, sf, x, disp)
     if (sf * np.exp(x @ beta)).min() < 2 * MIN_MU:
         return None
     return beta
