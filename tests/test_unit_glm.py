@@ -221,29 +221,40 @@ def _fitted(case, refit_cooks=True, fit_type="parametric", permutation_seed=None
 
 
 def _assert_same_fit(actual, expected, *, name, flags=("replaced", "refitted")):
-    """Public outputs of two ``deseq2()`` runs agree, gene by gene (labels aligned)."""
-    genes = expected.var_names
-    for field in [
-        "genewise_dispersions",
-        "fitted_dispersions",
-        "MAP_dispersions",
-        "dispersions",
-    ]:
+    """Public outputs of two ``deseq2()`` runs agree, gene by gene (labels aligned).
+
+    A gene whose MAP fit takes the grid fallback in one run only is left out of the
+    MAP-dependent comparisons (``helpers.map_fallback_flips``); at most one may.
+    """
+    flips = helpers.map_fallback_flips(actual, expected, rtol=DISPERSION_RTOL)
+    assert len(flips) <= 1, (name, list(flips))
+    genes = expected.var_names.difference(flips, sort=False)
+    for field in ["genewise_dispersions", "fitted_dispersions"]:
+        helpers.assert_fields_close(
+            actual.var[field].loc[expected.var_names],
+            expected.var[field],
+            rtol=DISPERSION_RTOL,
+            name=f"{name} {field}",
+        )
+    for field in ["MAP_dispersions", "dispersions"]:
         helpers.assert_fields_close(
             actual.var[field].loc[genes],
-            expected.var[field],
+            expected.var[field].loc[genes],
             rtol=DISPERSION_RTOL,
             name=f"{name} {field}",
         )
     helpers.assert_fields_close(
         actual.varm["LFC"].loc[genes],
-        expected.varm["LFC"],
+        expected.varm["LFC"].loc[genes],
         rtol=0,
         atol=LFC_ATOL,
         name=f"{name} LFC",
     )
     for flag in ["non_zero", *flags]:
-        assert actual.var[flag].loc[genes].equals(expected.var[flag]), (name, flag)
+        assert actual.var[flag].loc[genes].equals(expected.var[flag].loc[genes]), (
+            name,
+            flag,
+        )
     # Cook's distances scale with (y - mu)^2, so an LFC difference d changes them by
     # about 2 d mu / |y - mu| relative: 1e-3 relative for typical residuals, and an
     # absolute 1e-6 for the near-zero distances of near-zero residuals (the
@@ -251,11 +262,12 @@ def _assert_same_fit(actual, expected, *, name, flags=("replaced", "refitted")):
     cooks_actual = pd.DataFrame(
         actual.layers["cooks"], index=actual.obs_names, columns=actual.var_names
     )[genes]
+    cooks_expected = pd.DataFrame(
+        expected.layers["cooks"], index=expected.obs_names, columns=expected.var_names
+    )[genes]
     helpers.assert_fields_close(
         cooks_actual.T,
-        pd.DataFrame(
-            expected.layers["cooks"], index=expected.obs_names, columns=genes
-        ).T,
+        cooks_expected.T,
         rtol=1e-3,
         atol=1e-6,
         name=f"{name} cooks",
@@ -342,7 +354,8 @@ def test_trimmed_variance_hand_worked():
         dispersions.trimmed_variance(counts), [9.4375, 4 * 9.4375], rtol=1e-14
     )
     assert dispersions.trimmed_variance(x) == pytest.approx(9.4375, rel=1e-14)
-    # axis=1 is not tested: known-bugs/C-trimmed-variance-axis.md.
+    # axis=1 is not tested: the trimmed mean is subtracted without restoring the
+    # reduced axis, so rows are centred on the wrong means (PyDESeq2 uses axis=0).
     np.testing.assert_allclose(
         dispersions.trimmed_variance(counts, trim=0.25, axis=0),
         [6.4175, 4 * 6.4175],
@@ -579,7 +592,9 @@ def test_irls_solver_lfc_at_bound(sign):
         options={"xatol": 1e-12},
     ).x
     assert converged
-    assert beta[1] == pytest.approx(4.0 * sign, abs=1e-10)
+    # L-BFGS-B projects onto the bound; a solver that stops on a projected gradient
+    # may stop just inside it, so LFC_ATOL (the unbounded slope is 2.7 away).
+    assert beta[1] == pytest.approx(4.0 * sign, abs=LFC_ATOL)
     assert beta[0] == pytest.approx(intercept, abs=LFC_ATOL)
     np.testing.assert_allclose(mu, sf * np.exp(x @ beta), rtol=1e-12)
 
@@ -823,7 +838,7 @@ def test_inference_irls_mixed_convergence_and_bounds(inference):
         max_beta=4,
     )
     assert conv_b.all()
-    assert beta_b[1, 1] == pytest.approx(4.0, abs=1e-10)
+    assert beta_b[1, 1] == pytest.approx(4.0, abs=LFC_ATOL)  # at the bound
     np.testing.assert_allclose(
         beta_b[0],
         helpers.reference_glm_mle(y[:, 0], sf, x_steep, disp[0]),
@@ -993,7 +1008,7 @@ def test_refit_replaces_outliers_and_refits(fit_type):
     get LFC 0; genes that were not refit keep their first-pass estimates.
 
     ``MAP_dispersions`` of refit genes is not checked: PyDESeq2 leaves the first-pass
-    value there (known-bugs/C-refit-keeps-first-pass-map-dispersions.md).
+    value there, while DESeq2 copies the refit value back.
     """
     sim, dds = _fitted("TWO_GROUP", fit_type=fit_type)
     _, plain = _fitted("TWO_GROUP", refit_cooks=False, fit_type=fit_type)
@@ -1131,6 +1146,157 @@ def test_refit_replaces_outliers_and_refits(fit_type):
     np.testing.assert_array_equal(dds.layers["replace_cooks"], expected_cooks)
 
 
+# Two factors in cells of seven, so every sample is replaceable and, with four design
+# rows for three coefficients, the gene-wise means of the refit come from IRLS rather
+# than a linear model. ``wild1`` and ``wild2`` are drawn with dispersions 1.5 and 2.5
+# (the trend is near 0.1) and get one count 100 times their mean: after the refit they
+# are dispersion outliers, whose final dispersion is the gene-wise estimate.
+MULTI_REFIT = {
+    "n_genes": 60,
+    "n_samples": 28,
+    "seed": 62,
+    "factors": {"condition": ["A", "B"], "group": ["X", "Y"]},
+    "n_outliers": 8,
+    "disp_scatter": 0.2,
+    "n_all_zero": 1,
+    "n_single_sample": 1,
+}
+
+
+def _multi_refit_counts():
+    sim = helpers.simulate_counts(**MULTI_REFIT)
+    counts = sim.counts.copy()
+    rs = np.random.RandomState([62, 1])
+    for k, (mean, disp) in enumerate([(300, 1.5), (800, 2.5)]):
+        y = rs.negative_binomial(1 / disp, 1 / (1 + disp * mean), size=28)
+        y[rs.randint(28)] = 100 * mean
+        counts[f"wild{k + 1}"] = y
+    return sim, counts
+
+
+def test_refit_multi_factor_design():
+    """Refit under ``~group + condition``: which genes, and their new estimates.
+
+    As in test_refit_replaces_outliers_and_refits, but the gene-wise means come from
+    the GLM: IRLS at DESeq2's starting dispersion (the smaller of the rough estimate,
+    from a linear model of the normalized counts, and the moments estimate), here the
+    Newton reference at that dispersion. Refit genes that are dispersion outliers
+    keep their gene-wise estimate.
+    """
+    sim, counts = _multi_refit_counts()
+    design = "~group + condition"
+    dds = helpers.make_dds(counts, sim.metadata, design=design)
+    dds.deseq2()
+    plain = helpers.make_dds(counts, sim.metadata, design=design, refit_cooks=False)
+    plain.deseq2()
+    x = dds.obsm["design_matrix"].to_numpy(dtype=float)
+    n, p = x.shape
+    sf = dds.obs["size_factors"].to_numpy()
+    y = counts.to_numpy()
+    assert dds.obs["replaceable"].all()
+
+    cutoff = stats.f.ppf(0.99, p, n - p)
+    cooks = dds.layers["cooks"]
+    flagged = np.nan_to_num(cooks, nan=-np.inf) > cutoff
+    trimmed = stats.trim_mean(y / sf[:, None], 0.2, axis=0)[None, :] * sf[:, None]
+    replaced_counts = np.where(flagged, np.trunc(trimmed).astype(np.int64), y)
+    # Guards: no decision within 1% of the cutoff, no replacement near an integer.
+    assert (np.abs(np.nan_to_num(cooks, nan=0.0) / cutoff - 1) > 0.01).all()
+    frac = trimmed[flagged] % 1
+    assert ((trimmed[flagged] == 0) | ((frac > 1e-6) & (frac < 1 - 1e-6))).all()
+
+    replaced = flagged.any(axis=0)
+    new_all_zero = replaced & (replaced_counts == 0).all(axis=0)
+    refitted = replaced & ~new_all_zero
+    np.testing.assert_array_equal(dds.var["replaced"].to_numpy(), replaced)
+    np.testing.assert_array_equal(dds.var["refitted"].to_numpy(), refitted)
+    assert refitted.sum() >= 6 and new_all_zero.sum() == 1
+    assert (dds.varm["LFC"][new_all_zero].to_numpy() == 0).all()
+
+    # Genes that were not refit keep their first-pass estimates.
+    keep = ~replaced
+    for field in ["genewise_dispersions", "MAP_dispersions", "dispersions"]:
+        helpers.assert_fields_close(
+            dds.var[field][keep],
+            plain.var[field][keep],
+            rtol=DISPERSION_RTOL,
+            name=field,
+        )
+    helpers.assert_fields_close(
+        dds.varm["LFC"][keep], plain.varm["LFC"][keep], rtol=0, atol=LFC_ATOL, name="LFC"
+    )
+
+    coeffs = dds.uns["trend_coeffs"]
+    prior_var = float(np.asarray(dds.uns["prior_disp_var"]))
+    threshold = 2 * np.sqrt(float(np.asarray(dds.uns["_squared_logres"])))
+    expected = {f: [] for f in ["genewise", "fitted", "dispersions", "lfc"]}
+    outlier_genes, lfc_genes = [], []
+    genes = dds.var_names[refitted]
+    for gene in genes:
+        yj = replaced_counts[:, dds.var_names.get_loc(gene)].astype(float)
+        normed = yj / sf
+        linear = np.maximum(x @ np.linalg.lstsq(x, normed, rcond=None)[0], 1.0)
+        rough = max(np.sum(((normed - linear) ** 2 - linear) / linear**2) / (n - p), 0)
+        moments = (
+            normed.var(ddof=1) - np.mean(1 / sf) * normed.mean()
+        ) / normed.mean() ** 2
+        start = min(rough, moments)
+        assert start > 1e-6, gene  # clear of the min_disp start (a known issue)
+        mu_hat = sf * np.exp(x @ helpers.reference_glm_mle(yj, sf, x, start))
+        assert mu_hat.min() > 2 * MIN_MU, gene
+        genewise = helpers.reference_dispersion_mle(yj, mu_hat, x, max_disp=max(10.0, n))
+        fitted = coeffs["a0"] + coeffs["a1"] / normed.mean()
+        map_disp = helpers.reference_dispersion_mle(
+            yj,
+            mu_hat,
+            x,
+            max_disp=max(10.0, n),
+            prior_disp_var=prior_var,
+            prior_dispersion=fitted,
+        )
+        margin = np.log(genewise) - np.log(fitted) - threshold
+        assert abs(margin) > 0.05, gene  # the outlier rule is not decided by rounding
+        if margin > 0:
+            outlier_genes.append(gene)
+        expected["genewise"].append(genewise)
+        expected["fitted"].append(fitted)
+        expected["dispersions"].append(genewise if margin > 0 else map_disp)
+        # LFCs: the objective gap at 1e-7 relative for every gene (README; IRLS stops
+        # on a relative deviance change of 1e-8), and the coefficients at LFC_ATOL
+        # where the dispersion is below 1. On the flatter objectives of the two wild
+        # genes IRLS stops up to 4e-4 from the minimizer (gap 1e-9).
+        disp = dds.var.loc[gene, "dispersions"]
+        beta = helpers.reference_glm_mle(yj, sf, x, disp)
+        objective = helpers.glm_objective(yj, sf, x, disp)
+        fitted_beta = dds.varm["LFC"].loc[gene].to_numpy()
+        gap = (objective(fitted_beta) - objective(beta)) / abs(objective(beta))
+        assert gap < 1e-7, (gene, gap)
+        if disp < 1:
+            expected["lfc"].append(beta)
+            lfc_genes.append(gene)
+    assert {"wild1", "wild2"} <= set(outlier_genes)
+
+    for field, key, rtol in [
+        ("genewise_dispersions", "genewise", DISPERSION_RTOL),
+        ("fitted_dispersions", "fitted", 1e-10),  # a formula of the counts
+        ("dispersions", "dispersions", DISPERSION_RTOL),
+    ]:
+        helpers.assert_fields_close(
+            dds.var[field][genes],
+            np.array(expected[key]),
+            rtol=rtol,
+            name=f"refit {field}",
+        )
+    assert len(lfc_genes) >= 6
+    helpers.assert_fields_close(
+        dds.varm["LFC"].loc[lfc_genes],
+        pd.DataFrame(expected["lfc"], index=lfc_genes, columns=dds.varm["LFC"].columns),
+        rtol=0,
+        atol=LFC_ATOL,
+        name="refit LFC",
+    )
+
+
 def test_refit_without_replaceable_samples():
     """No cell reaches min_replicates: nothing is replaced and nothing changes."""
     sim, dds = _fitted("MIXED_CELLS")
@@ -1213,7 +1379,7 @@ class _ReferenceInference(DefaultInference):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.irls_calls = []
+        self.n_irls_calls = 0
 
     def lin_reg_mu(self, counts, size_factors, design_matrix, min_mu):
         coef = np.linalg.lstsq(design_matrix, counts / size_factors[:, None], rcond=None)
@@ -1233,7 +1399,7 @@ class _ReferenceInference(DefaultInference):
                 for i, d in enumerate(disp)
             ]
         )
-        self.irls_calls.append(beta)
+        self.n_irls_calls += 1
         return beta, mu, hat, np.ones(len(disp), dtype=bool)
 
 
@@ -1252,9 +1418,24 @@ def test_deseq2_uses_custom_inference_irls(n_cpus):
     default = helpers.make_dds(sim.counts, sim.metadata)
     default.deseq2()
 
-    # fit_LFC stores what irls returned, gene by gene: a copy, so exact.
-    assert custom.irls_calls
-    np.testing.assert_array_equal(dds.varm["LFC"].to_numpy(), custom.irls_calls[-1])
+    # fit_LFC stores what irls returned, gene by gene. The reference Newton solver
+    # is deterministic, so rerunning it on the stored dispersions and size factors
+    # reproduces it to rounding; 1e-10 allows for the inputs reaching irls in another
+    # layout, and is far below the ~1e-5 by which IRLS's own fit differs.
+    assert custom.n_irls_calls > 0
+    x = sim.design_matrix.to_numpy()
+    sf = dds.obs["size_factors"].to_numpy()
+    expected = [
+        helpers.reference_glm_mle(sim.counts[g].to_numpy(), sf, x, d)
+        for g, d in dds.var["dispersions"].items()
+    ]
+    helpers.assert_fields_close(
+        dds.varm["LFC"],
+        pd.DataFrame(expected, index=dds.var_names, columns=dds.varm["LFC"].columns),
+        rtol=0,
+        atol=1e-10,
+        name="LFC from the custom irls",
+    )
     np.testing.assert_allclose(
         dds.layers["cooks"], _cooks_reference(dds), rtol=COOKS_RTOL
     )

@@ -400,6 +400,31 @@ def test_reference_lowess_reproduces_a_line():
         )
 
 
+def test_map_fallback_flips():
+    """Only genes whose MAP differs between fits and sits on the gene-wise estimate
+    in one of them are returned; labels are aligned."""
+    from types import SimpleNamespace
+
+    genes = pd.Index(["g1", "g2", "g3", "g4"])
+
+    def fit(map_disp, order=genes):
+        var = pd.DataFrame(
+            {
+                "genewise_dispersions": [0.30, 0.10, 0.50, 0.20],
+                "MAP_dispersions": map_disp,
+            },
+            index=genes,
+        ).loc[order]
+        return SimpleNamespace(var=var, var_names=var.index)
+
+    first = fit([0.30, 0.12, 0.40, 0.25])  # g1 on its gene-wise value (fallback)
+    second = fit([0.35, 0.12, 0.45, 0.25001], order=genes[::-1])
+    # g1: differs, first on gene-wise -> flip. g3: differs, neither on gene-wise.
+    # g4: differs by 4e-5 only.
+    assert list(helpers.map_fallback_flips(first, second)) == ["g1"]
+    assert list(helpers.map_fallback_flips(first, first)) == []
+
+
 def test_compare_fields_names_the_differences():
     genes = ["g1", "g2", "g3"]
     expected = pd.DataFrame({"a": [1.0, 2.0, np.nan], "b": [1.0, 1.0, 1.0]}, index=genes)

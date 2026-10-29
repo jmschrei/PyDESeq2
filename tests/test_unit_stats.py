@@ -196,11 +196,10 @@ def reference_cooks_outlier(dds):
     samples have a larger count than the sample with the gene's largest Cook's
     distance. Refitted genes do not count their replaced samples.
 
-    DESeq2 applies the "three larger counts" exception only to two-group designs, and
-    PyDESeq2 to every design (known-bugs/D-cooks-three-larger-counts-all-designs.md),
-    so the comparisons use two-group designs. DESeq2 never flags genes that are all
-    zero after replacement and PyDESeq2 does
-    (known-bugs/D-cooks-filter-new-all-zero-genes.md); the comparisons leave them out
+    DESeq2 applies the "three larger counts" exception only to designs with a single
+    two-level factor, and PyDESeq2 to every design, so the comparisons use two-group
+    designs. DESeq2 never flags genes that are all zero after replacement (p-value 1)
+    and PyDESeq2 does (p-value NaN); the comparisons leave them out
     (:func:`_cooks_comparable`).
     """
     cooks = dds.layers["cooks"].copy()
@@ -393,8 +392,8 @@ def test_run_wald_test_matches_reference(dataset, request):
 
 def test_run_wald_test_with_unit_prior_LFC_var(two_group):
     """``prior_LFC_var`` replaces the 1e-6 ridge; with unit prior variances the ridge
-    is the identity whichever power of the variance it uses
-    (known-bugs/D-prior-lfc-var-squared.md)."""
+    is the identity whichever power of the variance it uses (PyDESeq2 uses
+    ``1 / prior_LFC_var**2``, DESeq2 ``1 / betaPriorVar``)."""
     ds = _stats(two_group, prior_LFC_var=np.ones(2))
     ds.run_wald_test()
     expected = reference_wald(two_group, ds.contrast_vector, ridge=np.eye(2))
@@ -639,9 +638,10 @@ def test_summary_alternative_hypotheses(two_group, alt, lfc_null):
 
     ``lfc_null`` is log2 and the Wald test works in natural log; the statistic does
     not depend on the scale. p-values are compared where DESeq2's statistic is not
-    clipped to zero (known-bugs/D-alt-hypothesis-clipped-p-values.md). The contrast
-    is a unit vector: for other contrasts the null is applied per coefficient
-    (known-bugs/D-lfc-null-applied-per-coefficient.md).
+    clipped to zero (where it is, PyDESeq2 reports 0.5 and DESeq2 the unclipped
+    tail). The contrast is a unit vector: for other contrasts PyDESeq2 applies the
+    null value and the alternative to each coefficient rather than to the
+    contrast.
     """
     ds = _stats(two_group, lfc_null=lfc_null, alt_hypothesis=alt, cooks_filter=False)
     ds.summary()
@@ -691,7 +691,10 @@ def test_contrast_between_non_reference_levels_matches_releveled_fit(multi_facto
     contrast agree up to the optimizers' precision and the 1e-6 ridge (which is not
     invariant to the parametrization). Tolerances: IRLS coefficients within 1e-3
     (natural log, README), SEs and statistics within 1e-3 relative, p-values within
-    1e-2 relative.
+    1e-2 relative. Genes whose MAP fit takes the grid fallback in one fit only are
+    left out (``helpers.map_fallback_flips``): on this design each numpy and scipy
+    build's L-BFGS-B fails on a few genes, a different few under rounding-level
+    changes.
     """
     ds = _stats(multi_factor, contrast=["group", "Z", "Y"])
     ds.summary()
@@ -704,7 +707,10 @@ def test_contrast_between_non_reference_levels_matches_releveled_fit(multi_facto
     ref = _stats(releveled, contrast=["group", "Z", "W"])
     ref.summary()
 
-    a, e = ds.results_df, ref.results_df
+    flips = helpers.map_fallback_flips(releveled, multi_factor)
+    assert len(flips) <= 3, list(flips)
+    genes = multi_factor.var_names.difference(flips, sort=False)
+    a, e = ds.results_df.loc[genes], ref.results_df.loc[genes]
     helpers.assert_fields_close(
         a["log2FoldChange"], e["log2FoldChange"], rtol=0, atol=1e-3 / LOG2, name="lfc"
     )
@@ -968,28 +974,42 @@ def test_results_do_not_depend_on_n_cpus_or_batch_size(two_group):
 
 def test_results_permute_with_genes(n_cpus):
     """Permuting the genes of the count matrix permutes every column of the results,
-    unshrunk and shrunk."""
+    unshrunk and shrunk.
+
+    The two fits are separate ``deseq2()`` runs, so they agree to the solvers'
+    precision, not to rounding: a solver whose stopping point depends on which genes
+    share a batch is a correct reorganization. Dispersions within 1e-3 relative and
+    LFCs within 1e-3 (natural log) move the statistic by about 1e-3 relative plus
+    1e-3 / SE; SEs of these genes are above 0.05, so 2e-2 absolute. A two-sided
+    p-value moves by about ``stat^2`` times the statistic's relative change (and
+    BH-adjusted values with it), so 5e-2 relative with a 1e-6 floor. A gene whose
+    MAP fit takes the grid fallback in one run only is left out
+    (``helpers.map_fallback_flips``).
+    """
     counts, metadata = _two_group_counts()
     order = np.random.RandomState(20).permutation(counts.shape[1])
-    results = []
+    fits, results = [], []
     for c in (counts, counts.iloc[:, order]):
-        ds = _stats(_fit(c, metadata))
+        dds = _fit(c, metadata)
+        ds = _stats(dds)
         ds.summary()
         unshrunk = ds.results_df.copy()
         ds.lfc_shrink(coeff=TWO_GROUP_COEFF)
+        fits.append(dds)
         results.append((unshrunk, ds.results_df))
+    flips = helpers.map_fallback_flips(fits[1], fits[0])
+    assert len(flips) <= 1, list(flips)
+    genes = fits[0].var_names.difference(flips, sort=False)
+    se = results[0][0]["lfcSE"].loc[genes] * LOG2  # natural log
+    assert se[se > 0].min() > 0.05
     for a, b in zip(results[0], results[1], strict=True):
-        b = b.loc[a.index]
-        # The trend and prior fits sum over genes in a different order, which moves
-        # dispersions by rounding; p-values of the most significant genes amplify it.
+        a, b = a.loc[genes], b.loc[genes]
+        # The counts after outlier replacement: rounding only.
+        helpers.assert_fields_close(b["baseMean"], a["baseMean"], rtol=1e-12)
+        helpers.assert_fields_close(b["lfcSE"], a["lfcSE"], rtol=2e-3)
+        helpers.assert_fields_close(b["stat"], a["stat"], rtol=2e-3, atol=2e-2)
         helpers.assert_fields_close(
-            b[["baseMean", "stat", "lfcSE"]],
-            a[["baseMean", "stat", "lfcSE"]],
-            rtol=1e-6,
-            atol=1e-12,
-        )
-        helpers.assert_fields_close(
-            b[["pvalue", "padj"]], a[["pvalue", "padj"]], rtol=1e-4, atol=1e-12
+            b[["pvalue", "padj"]], a[["pvalue", "padj"]], rtol=5e-2, atol=1e-6
         )
         helpers.assert_fields_close(
             b["log2FoldChange"], a["log2FoldChange"], rtol=0, atol=SHRINK_ATOL / LOG2

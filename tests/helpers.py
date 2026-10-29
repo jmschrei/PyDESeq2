@@ -7,6 +7,8 @@ bitwise equality, no dependence on ``n_cpus`` or test order) are written in
 Contents:
 
 - :func:`get_test_cpus`, :func:`make_dds`: run PyDESeq2 at a fixed ``n_cpus``.
+- :func:`map_fallback_flips`: genes whose MAP dispersion took different branches in
+  two fits.
 - :func:`simulate_counts`: seeded negative binomial counts with recorded truth.
 - :func:`size_factor_example`, :func:`nb_example`: small hand-worked inputs.
 - :func:`nb_logpmf`, :func:`nb_loglik`: reference likelihood (``scipy.stats.nbinom``
@@ -73,6 +75,35 @@ def get_test_cpus() -> int:
     if n_cpus < 1:
         raise ValueError(f"{CPUS_ENV_VAR} must be a positive integer, got {value!r}.")
     return n_cpus
+
+
+def map_fallback_flips(
+    first: DeseqDataSet, second: DeseqDataSet, rtol: float = 1e-3
+) -> pd.Index:
+    """Genes whose MAP dispersion comes from a different branch in two fits.
+
+    When L-BFGS-B fails on a gene's MAP objective, ``fit_alpha_mle`` falls back to a
+    grid search without the prior (a known issue), which lands near the gene-wise
+    estimate. On genes where L-BFGS-B's convergence is marginal, a change in the
+    inputs at the level of rounding (another summation order in the trend fit, a
+    solver upstream that stops elsewhere within its tolerance) decides the branch,
+    and the MAP dispersion moves by up to 30%. Returns the genes (of ``second``,
+    labels aligned) whose ``MAP_dispersions`` differ by more than ``rtol`` between
+    the fits while one of the two is within 2% of that fit's gene-wise estimate
+    (the grid's spacing). Compare the fits on the other genes, and bound how many
+    are returned.
+    """
+    genes = second.var_names
+    map_1 = first.var["MAP_dispersions"].loc[genes].to_numpy()
+    map_2 = second.var["MAP_dispersions"].to_numpy()
+    gw_1 = first.var["genewise_dispersions"].loc[genes].to_numpy()
+    gw_2 = second.var["genewise_dispersions"].to_numpy()
+    with np.errstate(invalid="ignore"):
+        differ = np.abs(map_1 - map_2) > rtol * np.abs(map_2)
+        near_genewise = (np.abs(map_1 / gw_1 - 1) < 0.02) | (
+            np.abs(map_2 / gw_2 - 1) < 0.02
+        )
+    return genes[differ & near_genewise]
 
 
 def make_dds(

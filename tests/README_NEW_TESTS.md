@@ -8,14 +8,18 @@ changes by more than the precision of the method that produced it.
 
 | File | Contents |
 |---|---|
-| `tests/helpers.py` | simulator, hand-worked inputs, reference likelihood and fits, comparison helper |
+| `tests/helpers.py` | simulator, hand-worked inputs, reference implementations (likelihood, fits, Wald test, apeglm, BH, lowess, independent filtering), comparison helper |
 | `tests/conftest.py` | `n_cpus` and `inference` fixtures; a report header naming the PyDESeq2 under test |
 | `tests/TARGETS.md` | every public target, its area and test file, and whether the existing tests reach it |
 | `tests/test_unit_harness.py` | self-tests of `helpers.py` |
-| `tests/test_unit_data.py` | area A: data handling and normalization |
-| `tests/test_unit_dispersions.py` | area B: dispersions |
-| `tests/test_unit_glm.py` | area C: GLM fitting, Cook's distances, refit (to be written) |
-| `tests/test_unit_deseqstats.py` | area D: Wald tests, filtering, p-value adjustment, shrinkage (to be written) |
+| `tests/test_unit_data.py` | area A: size factors, preprocessing, `misc` |
+| `tests/test_unit_data_dataset.py` | area A: `DeseqDataSet` constructor, `Inference` interface |
+| `tests/test_unit_data_vst.py` | area A: variance-stabilizing transform |
+| `tests/test_unit_dispersions.py` | area B: dispersion functions (gene-wise MLE, trend, moments, grid) |
+| `tests/test_unit_dispersions_dds.py` | area B: `DeseqDataSet` dispersion methods, R fixtures in `tests/data/unit_b/` |
+| `tests/test_unit_glm.py` | area C: GLM fitting, Cook's distances, refit |
+| `tests/test_unit_stats.py` | area D: `DeseqStats` (Wald tests, Cook's filtering, p-value adjustment, shrinkage) |
+| `tests/test_unit_stats_functions.py` | area D: `glm.wald_test`, `nbinomFn`, `nbinomGLM`, `grid_fit_shrink_beta`, `lowess` |
 
 ## Running
 
@@ -62,6 +66,8 @@ existing suite is the 65 tests in `test_pydeseq2.py`, `test_edge_cases.py` and
 | today, pandas pinned to 3.0.6 | 3.12.13 | 3.0.6 | 2.5.4 | 1.18.1 | 0.13.4 | pass | pass |
 | today, pandas pinned to 3.0.6 | 3.14.3 | 3.0.6 | 2.5.4 | 1.18.1 | 0.13.4 | pass | pass |
 | today, pandas pinned below 3 | 3.12.13 | 2.3.3 | 2.5.4 | 1.18.1 | 0.13.4 | pass | pass |
+| today, pandas below 3, formulaic 1.0.2 (the lowest allowed) | 3.12.13 | 2.3.3 | 2.5.4 | 1.18.1 | 0.13.4 | pass | pass |
+| today, scipy pinned to 1.15.0 (the lowest allowed) | 3.12.13 | 3.1.0 | 2.4.6 | 1.15.0 | 0.13.4 | 49 failed, 2 errors | pass |
 
 Why: pandas 3.1.0 (released 2026-10-22, after the last passing scheduled CI run on
 2026-10-15) emits two `Pandas4Warning`s (a `DeprecationWarning` subclass), which the
@@ -82,6 +88,12 @@ An environment resolved as the `pre` job (continue-on-error) would have been on
 makes the existing suite pass, and so does ignoring the two messages on pandas 3.1.0
 (`-W "ignore:The 'future.infer_string' option is deprecated:DeprecationWarning"
 -W "ignore:The inplace keyword:DeprecationWarning"`: 65 passed in `py3.12-stable`).
+
+formulaic 1.0.2 does not recognise pandas 3's `str` dtype as categorical: with
+pandas 3.1.0 it passes a string column such as `condition` into the model matrix
+unencoded, so `DeseqDataSet` cannot be built (`Cannot cast ufunc 'svd' input from
+dtype('O')`) and the existing suite fails (45 failed, 2 errors, with the two pandas
+messages above ignored), as do the new tests. With pandas 2.3.3 both pass.
 
 With the lowest versions the direct dependencies allow (`uv pip install
 --resolution lowest-direct`: numpy 2.2.0, scipy 1.15.0, pandas 2.3.0, anndata
@@ -137,7 +149,32 @@ Measured against the reference minimizers in `helpers.py` on simulated genes:
   continuous covariate); relative objective gap up to 1.3e-8. Use `atol=1e-3` on
   natural-log coefficients, or compare objective values at 1e-7 relative. Genes
   with a fitted mean below `min_mu=0.5` are not comparable to the reference: IRLS
-  clamps the mean there, which changes its fixed point.
+  clamps the mean there, which changes its fixed point. On flat objectives (high
+  dispersions) IRLS stops further from the minimizer, up to 4e-4 at dispersion 2.5,
+  while the objective gap stays near 1e-9.
+- Dispersions on `min_disp` or `max_disp`, and LFCs on `min_beta` or `max_beta`:
+  compare with the bound at the solver's precision (1e-4 relative for dispersions,
+  `atol=1e-3` for LFCs), not to rounding. L-BFGS-B projects onto the bound, but a
+  solver that stops on a projected gradient may stop just inside it.
+- `nbinomGLM` (apeglm shrinkage) stops L-BFGS-B at `ftol=gtol=1e-8` on its objective
+  divided by the objective at beta = 0: against the reference MAP, absolute errors
+  up to 3.5e-3 on the shrunk natural-log coefficient (6.4e-3 on any coefficient)
+  and relative objective gaps up to 8.5e-6, over 820 simulated genes. The shrinkage
+  tests use `atol=2e-2` on coefficients and 1e-4 on objective gaps, for dispersions
+  well above 1e-6 (see the known issues).
+- The Wald test, Cook's distances and the hat diagonal are closed-form given the
+  fitted LFCs and dispersions; recomputed from a fit's public outputs they agree to
+  rounding (relative 1e-8 covers condition numbers of `X^T W X + ridge` up to about
+  1e6 and was checked against a batched and a closed-form 2 x 2 rewrite).
+
+Two separate fits (gene order, `n_cpus`, `batch_size`, another parametrization of
+the same design) agree to the solvers' precision, not to rounding: a reorganized
+solver whose stopping point depends on which genes share a batch is still correct.
+Compare them with the tolerances above, and leave out genes whose MAP dispersion
+took the grid fallback in one fit only (`helpers.map_fallback_flips`): where
+L-BFGS-B's convergence on the MAP objective is marginal, rounding-level changes
+decide whether it fails, and the fallback, which drops the prior, moves the gene
+by up to 30%.
 
 ## Writing a test
 
@@ -169,6 +206,8 @@ Measured against the reference minimizers in `helpers.py` on simulated genes:
 ### Helpers (`tests/helpers.py`)
 
 - `get_test_cpus()`, `make_dds(...)`; fixtures `n_cpus`, `inference`.
+- `map_fallback_flips(first, second)`: genes whose MAP dispersion took L-BFGS-B in
+  one fit and the grid fallback in the other (see the precision section).
 - `simulate_counts(n_genes=200, n_samples=12, *, seed=0, factors={"condition":
   ["A", "B"]}, continuous=(), design=None, mean_range=(10, 5000), frac_de=0.3,
   lfc_sd=1.0, trend=(0.1, 4.0), disp_scatter=0.0, size_factor_sd=0.3, n_all_zero=0,
@@ -183,7 +222,11 @@ Measured against the reference minimizers in `helpers.py` on simulated genes:
 - `nb_logpmf`, `nb_loglik`: the NB log-likelihood (mean `mu`, variance
   `mu + alpha mu^2`). Equal to `scipy.stats.nbinom` where scipy is accurate, and
   written so that it stays accurate as `alpha` goes to 0 (checked against the
-  Poisson limit), where scipy's form is off by up to 2e-7 per sample at 1e-8.
+  Poisson limit), where scipy's form is off by up to 2e-7 per sample at 1e-8. Its
+  values are accurate to about 1e-11 absolute on typical genes (more for counts near
+  1e7, whose terms reach 1e8), which limits finite differences of it: a central
+  difference with step `h` carries an error near `1e-11 / h`. Differentiating the
+  dispersion objective needed Richardson extrapolation to check `dnb_nll`.
 - `dispersion_objective(counts, mu, design_matrix, *, cr_reg=True,
   prior_disp_var=None, prior_dispersion=None)` and `reference_dispersion_mle(...,
   min_disp=1e-8, max_disp=10.0, grid_size=2001)`: the Cox-Reid adjusted (and
@@ -191,7 +234,22 @@ Measured against the reference minimizers in `helpers.py` on simulated genes:
   bounded Brent search.
 - `glm_objective(counts, size_factors, design_matrix, disp, *, ridge=1e-6)` and
   `reference_glm_mle(...)`: the ridge-penalized NB GLM objective PyDESeq2's IRLS
-  solves, minimized by Newton's method.
+  solves, minimized by Newton's method. The stop rule and the step halving allow for
+  rounding (of the gradient and of the objective), so it converges on counts near
+  1e7, where the objective cannot resolve the last steps.
+- `wald_reference(x, disp, beta, mu, ridge, contrast)`: DESeq2's Wald test of one
+  gene (sandwich covariance of the ridge-penalized estimate).
+- `apeglm_objective`, `apeglm_grad_hess`, `reference_map(x, counts, size, offset,
+  shrink_index, prior_scale, starts)`: apeglm's negative log posterior (NB
+  likelihood, N(0, 15^2) prior on the coefficients not shrunk, Cauchy prior on the
+  shrunk one), its gradient and Hessian, and its minimizer by trust-region Newton
+  from several starts; `reference_map` also returns the spread of the starts' minima,
+  and a spread above `BIMODAL_SPREAD` means two local minima. `apeglm_prior_var`:
+  apeglm's adaptive prior variance.
+- `bh_adjust`, `reference_lowess`, `reference_independent_filtering`:
+  Benjamini-Hochberg by hand, Cleveland's robust lowess (as Biopython's, which
+  `pydeseq2.stats.lowess` follows) and DESeq2's independent filtering
+  (`pvalueAdjustment` in DESeq2's `results.R`).
 - `compare_fields(actual, expected, *, rtol, atol=0.0, name)` and
   `assert_fields_close(...)`: per-field tolerance comparison; NaN and infinity
   positions must match exactly; the failure message lists failing genes and fields.
@@ -258,6 +316,20 @@ fixture or into the case's README.
 
 ## Known issues in the current code (not tested)
 
+Each was compared with DESeq2 1.50.2 (and apeglm 1.32.0) or with the documented
+behaviour; the tests avoid the inputs that reach them.
+
+Size factors and normalization:
+
+- `fit_size_factors(fit_type="poscounts")` drops genes whose positive counts are all
+  1 (`logmeans > 0`); DESeq2 keeps every gene that is not all zero.
+- `deseq2_norm_transform` (and `vst_transform` on new samples) takes the median of
+  `log(count) - logmean` including zero counts, which enter as `-inf`: a new sample
+  with zeros in at least half of the fitted genes gets size factor 0 and NaN or
+  infinite normalized counts. DESeq2 leaves zero counts out of that median.
+
+Dispersions:
+
 - Gene-wise dispersions whose starting value (the minimum of the rough and moments
   estimates) is at `min_disp` stay at `min_disp`, even when the Cox-Reid objective
   is lower elsewhere. DESeq2 1.50.2 does the same.
@@ -265,8 +337,52 @@ fixture or into the case's README.
   `grid_fit_alpha` without passing `prior_disp_var`, `cr_reg` or `prior_reg`, so
   those genes get the gene-wise MLE instead of the MAP estimate. DESeq2's grid
   fallback keeps the prior.
-- `fit_size_factors(fit_type="poscounts")` drops genes whose positive counts are all
-  1 (`logmeans > 0`); DESeq2 keeps every gene that is not all zero.
+- The parametric dispersion trend (DEA and VST) fits its first gamma GLM to every
+  non-zero gene and never re-admits genes it drops; DESeq2 starts from the curve
+  `0.1 + 1 / mean` and reselects genes within `(1e-4, 15)` times the current curve
+  before every fit. A few genes with a count in one sample (dispersion on the upper
+  bound) are enough to move `a1` two- to threefold.
+
+GLM fitting, Cook's distances and refit:
+
+- `irls_solver` uses `min_beta` only as the bound of its fallback optimizer, so with
+  asymmetric bounds a converged IRLS fit can return an LFC below `min_beta`; the
+  `max_beta` docstring gives its default as -30 (it is 30).
+- After a refit, refit genes keep their first-pass `MAP_dispersions`, while
+  `dispersions`, `genewise_dispersions`, `fitted_dispersions` and `LFC` hold the
+  refit values; DESeq2 copies the refit `dispMAP` back too.
+- `dispersions.trimmed_variance(..., axis=1)` subtracts the trimmed means without
+  restoring the reduced axis, so it centres the rows on the wrong means (or raises
+  for non-square input). PyDESeq2 itself only uses `axis=0`.
+
+Testing and shrinkage:
+
+- With `alt_hypothesis` `"greater"`, `"less"` or `"lessAbs"`, genes whose statistic
+  is clipped to zero get p-value 0.5; DESeq2 computes these p-values from the
+  unclipped normal tail (between 0.5 and 1).
+- `lfc_null` and `alt_hypothesis` are applied to each coefficient before the contrast
+  is taken, which equals DESeq2's test of the contrast only for unit contrast
+  vectors (a reversed or level-vs-level contrast tests a different null).
+- `prior_LFC_var` enters the Wald test's ridge as `1 / prior_LFC_var**2`; a normal
+  prior of that variance (and DESeq2's `betaPriorVar`) gives `1 / prior_LFC_var`.
+- The shrunk `lfcSE` comes from a Hessian in `nbinomGLM` to which the prior's
+  curvature is added on every row (`np.diag` of a diagonal matrix is its diagonal
+  vector), so off-diagonal entries are wrong: up to 18.6% from DESeq2's `lfcSE`
+  on the bundled synthetic data.
+- `nbinomGLM` reports convergence but stops far from the MAP for dispersions of 1e-6
+  and below (reachable, as `min_disp` is 1e-8); apeglm's `nbinomCR` recovers it by
+  refitting from a second start.
+- Genes that become all zero after outlier replacement get p-value 1 from
+  `run_wald_test` and then NaN from Cook's filtering, because `replace_cooks` zeroes
+  the distances of refitted genes only; DESeq2 reports 1.
+- The "three or more larger counts" exception to Cook's filtering is applied to every
+  design; DESeq2 applies it only when the design has a single two-level factor.
+- `stats.lowess` with robustness iterations returns 0 at points of an exactly fitted
+  neighbourhood: the residuals are rounding noise, the bisquare weights become 0 and
+  the weighted normal equations vanish. Which points depends on the numpy build.
+
+Other:
+
 - `import pydeseq2.grid_search` as the first PyDESeq2 import raises an `ImportError`
   (circular import with `distributions`). Inside the suite `conftest.py` imports
   `pydeseq2.default_inference` first, so tests are not affected.

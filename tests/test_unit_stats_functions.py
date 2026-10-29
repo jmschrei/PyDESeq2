@@ -119,9 +119,10 @@ def test_wald_test_matches_sandwich_formula(design):
 # sf((b - T)/s); less: stat min((b + T)/s, 0), p cdf((b + T)/s). PyDESeq2 passes the
 # null value itself as lfc_null, so DESeq2's "less" with threshold T is lfc_null = -T.
 # PyDESeq2 reports lessAbs's statistic with a sign; its magnitude is DESeq2's. Where
-# DESeq2's greater, less or lessAbs statistic is clipped to zero, PyDESeq2's p-value
-# differs (known-bugs/D-alt-hypothesis-clipped-p-values.md), so p-values are compared
-# only where the statistic is not clipped.
+# DESeq2's greater, less or lessAbs statistic is clipped to zero, PyDESeq2 computes
+# the p-value from the clipped statistic (0.5) while DESeq2 uses the unclipped normal
+# tail (between 0.5 and 1), so p-values are compared only where the statistic is not
+# clipped.
 @pytest.mark.parametrize(
     "alt, threshold, lfc",
     [
@@ -279,8 +280,10 @@ def test_nbinomGLM_inverse_hessian_under_a_weak_prior():
     With prior scale 10 the prior's curvature (at most 2 / 10^2 = 0.02 on the shrunk
     coefficient, 1/225 on the others) is below 1e-3 of the smallest diagonal entry of
     the likelihood's curvature on these genes (checked below), so how the prior terms
-    enter the Hessian moves its inverse by less than 1e-3 (see
-    known-bugs/D-shrink-hessian-prior-broadcast.md for the case of a strong prior).
+    enter the Hessian moves its inverse by less than 1e-3. (Under a strong prior the
+    returned matrix differs from the inverse Hessian: ``nbinomGLM`` adds the prior's
+    curvature to every row, ``np.diag`` of a diagonal matrix being its diagonal
+    vector.)
     The MAP is within SHRINK_ATOL of the reference, which moves the curvature by
     under 2%; 5e-2 relative on the diagonal of the inverse covers both.
     """
@@ -384,8 +387,8 @@ def test_lowess_reproduces_a_line():
     """One local linear fit (``iter=1``) of exactly linear data is the line.
 
     Only ``iter=1``: with robustness iterations the residuals of an exact fit are at
-    the rounding level and their bisquare weights are arbitrary
-    (known-bugs/D-lowess-exact-fit.md).
+    the rounding level, their bisquare weights are set by rounding noise, and points
+    whose neighbourhood gets weight 0 are returned as 0.
     """
     x = np.linspace(0.1, 0.95, 50)
     y = 3.0 - 7.5 * x

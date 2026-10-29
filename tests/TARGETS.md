@@ -8,7 +8,7 @@ Every public class, method and module-level function of `src/pydeseq2`, found by
 
 ## Areas
 
-Each area owns one new test file, so writers can work in parallel without editing the same file. All of them share `tests/helpers.py` and `tests/conftest.py`; changes to those go through the harness owner.
+Each area owns its own test files, so writers can work in parallel without editing the same file. All of them share `tests/helpers.py` and `tests/conftest.py`; changes to those go through the harness owner.
 
 The brief's starting split is kept, with these adjustments made from the source:
 
@@ -20,7 +20,7 @@ The brief's starting split is kept, with these adjustments made from the source:
 
 ## A. Data handling and normalization
 
-File: `tests/test_unit_data.py`.
+Files: `tests/test_unit_data.py`, `tests/test_unit_data_dataset.py`, `tests/test_unit_data_vst.py`.
 
 | Done | Target | Kind | Docs | Existing tests reach it |
 |---|---|---|---|---|
@@ -45,7 +45,7 @@ Private methods this area covers through the public ones above: `DeseqDataSet._c
 
 ## B. Dispersions
 
-File: `tests/test_unit_dispersions.py`.
+Files: `tests/test_unit_dispersions.py`, `tests/test_unit_dispersions_dds.py`.
 
 | Done | Target | Kind | Docs | Existing tests reach it |
 |---|---|---|---|---|
@@ -100,7 +100,7 @@ Private methods this area covers through the public ones above: `DeseqDataSet._r
 
 ## D. Testing and shrinkage
 
-File: `tests/test_unit_deseqstats.py`.
+Files: `tests/test_unit_stats.py`, `tests/test_unit_stats_functions.py`.
 
 | Done | Target | Kind | Docs | Existing tests reach it |
 |---|---|---|---|---|
