@@ -1,8 +1,8 @@
 """Area B: dispersions (see tests/TARGETS.md).
 
 Module-level functions and ``DefaultInference`` methods. The ``DeseqDataSet``
-dispersion steps are in ``test_unit_dispersions_dds.py``, which imports the reference
-implementations defined here.
+dispersion steps are in ``test_unit_dispersions_dds.py``, which imports this module's
+tolerances; the reference implementations both use are in ``tests/helpers.py``.
 """
 
 import numpy as np

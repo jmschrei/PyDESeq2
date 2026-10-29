@@ -1297,6 +1297,22 @@ def test_refit_multi_factor_design():
     )
 
 
+def test_refit_called_step_by_step():
+    """``refit()`` after the individual fitting steps gives what ``deseq2()`` gives."""
+    sim, expected = _fitted("TWO_GROUP")
+    dds = helpers.make_dds(sim.counts, sim.metadata, design=sim.design)
+    dds.fit_size_factors()
+    dds.fit_genewise_dispersions()
+    dds.fit_dispersion_trend()
+    dds.fit_dispersion_prior()
+    dds.fit_MAP_dispersions()
+    dds.fit_LFC()
+    dds.calculate_cooks()
+    dds.refit()
+    assert dds.var["refitted"].sum() >= 4
+    _assert_same_fit(dds, expected, name="step by step")
+
+
 def test_refit_without_replaceable_samples():
     """No cell reaches min_replicates: nothing is replaced and nothing changes."""
     sim, dds = _fitted("MIXED_CELLS")

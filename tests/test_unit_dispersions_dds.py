@@ -2,7 +2,7 @@
 
 ``fit_genewise_dispersions``, ``fit_dispersion_trend``, ``disp_function``,
 ``fit_dispersion_prior`` and ``fit_MAP_dispersions``, checked against reference
-implementations (``test_unit_dispersions.py``), hand-worked values and DESeq2 1.50.2
+implementations (``tests/helpers.py``), hand-worked values and DESeq2 1.50.2
 (``tests/data/unit_b``).
 """
 

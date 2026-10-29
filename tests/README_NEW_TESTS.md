@@ -33,6 +33,9 @@ PYDESEQ2_TEST_CPUS=4 python -m pytest tests/test_unit_*.py
 ```
 
 - `pytest` and `python -m pytest` both work (CI uses `coverage run -m pytest`).
+- Wall time on 2026-10-28 (Python 3.12, pandas 3.0.6, one BLAS thread): the new
+  tests take about 15 s serially at `PYDESEQ2_TEST_CPUS=1`, and the whole suite
+  about 18 s with `-n 4` and the CPU count Python reports capped at 2 (see below).
 - The report header names the PyDESeq2 under test and its directory, and the
   `PYDESEQ2_TEST_CPUS` in effect. To test a source tree without installing it, add
   `PYTHONPATH=src`.
@@ -237,6 +240,13 @@ by up to 30%.
   solves, minimized by Newton's method. The stop rule and the step halving allow for
   rounding (of the gradient and of the objective), so it converges on counts near
   1e7, where the objective cannot resolve the last steps.
+- `median_of_ratios(counts, control=None)`, `lin_reg_mu(...)`,
+  `rough_dispersions(...)`, `moments_dispersions(...)`: DESeq2's ratio size factors,
+  linear-model means (floored at `min_mu`) and starting dispersion estimates.
+  `gamma_identity_glm(x, y, start)` and `reference_trend(normed_means, dispersions,
+  *, min_disp=None)`: DESeq2's `parametricDispersionFit` (gamma GLM with identity
+  link by IRLS, refit on the genes within `(1e-4, 15)` times the current curve);
+  with `min_disp`, genes not above `100 * min_disp` are left out first.
 - `wald_reference(x, disp, beta, mu, ridge, contrast)`: DESeq2's Wald test of one
   gene (sandwich covariance of the ridge-penalized estimate).
 - `apeglm_objective`, `apeglm_grad_hess`, `reference_map(x, counts, size, offset,
