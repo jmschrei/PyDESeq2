@@ -33,7 +33,7 @@ LOG2 = np.log(2)
 # The Wald quantities are a few products and a p x p inverse per gene, computed from
 # the same inputs here and in PyDESeq2; they differ by rounding, amplified by the
 # condition number of X^T W X + ridge (up to about 1e6 for genes with a near-zero
-# group). p-values are relative to the statistic's error times stat^2.
+# group). A p-value's relative error is about stat^2 times the statistic's.
 WALD_RTOL = 1e-8
 PVALUE_RTOL = 1e-6
 
@@ -79,18 +79,36 @@ def two_group():
     return _fit(*_two_group_counts())
 
 
-@pytest.fixture(scope="module")
-def few_replicates():
-    """12 samples in two groups of 6: Cook's outliers are flagged but not replaced."""
-    sim = helpers.simulate_counts(
+def _few_replicates_sim():
+    return helpers.simulate_counts(
         n_genes=120, n_samples=12, seed=12, disp_scatter=0.3, n_outliers=8
     )
-    return _fit(sim.counts, sim.metadata)
+
+
+@pytest.fixture(scope="module")
+def few_replicates():
+    """12 samples in two groups of 6: Cook's outliers are flagged but not replaced.
+
+    ``two_larger`` has a high count (600) in group A whose Cook's distance is above
+    the cutoff and exactly two larger counts, in group B.
+    """
+    sim = _few_replicates_sim()
+    counts = sim.counts.copy()
+    in_a = (sim.metadata["condition"] == "A").to_numpy()
+    two_larger = np.zeros(12, dtype=np.int64)
+    two_larger[in_a] = [600, 50, 52, 48, 51, 49]
+    two_larger[~in_a] = [700, 710, 400, 410, 405, 395]
+    counts["two_larger"] = two_larger
+    return _fit(counts, sim.metadata)
 
 
 @pytest.fixture(scope="module")
 def unbalanced():
-    """Two groups of 2 and 8 samples: only the group of 8 counts for Cook's maxima."""
+    """Two groups of 2 and 8 samples: only the group of 8 counts for Cook's maxima.
+
+    The counts are drawn for alternating groups and then relabelled, so they do not
+    follow this design; only the Cook's filtering of the result is of interest.
+    """
     sim = helpers.simulate_counts(
         n_genes=80, n_samples=10, seed=13, disp_scatter=0.3, n_outliers=10
     )
@@ -183,6 +201,13 @@ def reference_cooks_outlier(dds):
     more replicates exceeds the 0.99 quantile of F(p, n - p), unless three or more
     samples have a larger count than the sample with the gene's largest Cook's
     distance. Refitted genes do not count their replaced samples.
+
+    DESeq2 applies the "three larger counts" exception only to two-group designs, and
+    PyDESeq2 to every design (known-bugs/D-cooks-three-larger-counts-all-designs.md),
+    so the comparisons use two-group designs. DESeq2 never flags genes that are all
+    zero after replacement and PyDESeq2 does
+    (known-bugs/D-cooks-filter-new-all-zero-genes.md); the comparisons leave them out
+    (:func:`_cooks_comparable`).
     """
     cooks = dds.layers["cooks"].copy()
     if dds.refit_cooks and "refitted" in dds.var and dds.var["refitted"].any():
@@ -221,11 +246,21 @@ def _new_all_zero(dds):
     return replaced & ~refitted
 
 
+def _cooks_comparable(dds):
+    """Genes whose Cook's outlier flag is compared: all but those all zero after
+    outlier replacement (see :func:`reference_cooks_outlier`)."""
+    if dds.refit_cooks and "refitted" in dds.var:
+        return ~_new_all_zero(dds)
+    return np.ones(dds.n_vars, dtype=bool)
+
+
 # DeseqDataSet.cond and DeseqDataSet.contrast
 
 
 @pytest.mark.parametrize(
-    "design", [MULTI_DESIGN, "~condition * group", "~condition + C(group)"]
+    "design",
+    [MULTI_DESIGN, "~condition * group", "~condition + C(group)"],
+    ids=["additive", "interaction", "categorical"],
 )
 def test_cond_is_the_design_row(design):
     """``cond(**levels)`` is the design-matrix row of a sample with those levels.
@@ -299,7 +334,7 @@ def test_deseqstats_variables(multi_factor):
 
 
 def test_deseqstats_constructor_validates_inputs(two_group):
-    """Documented checks: a contrast is required, a contrast vector has one entry per
+    """Input checks: a contrast is required, a contrast vector has one entry per
     design column, a negative null is invalid for the absolute hypotheses, and
     ``refit_cooks`` needs ``refit`` to have run."""
     with pytest.raises(ValueError):
@@ -460,7 +495,10 @@ def test_summary_results_table(dataset, request):
         # Every row of this design is unique (continuous covariate), so no sample
         # has the three replicates needed to count towards a Cook's maximum.
         assert not dds.cooks_outlier().any()
-    helpers.assert_fields_close(res["pvalue"], pvalues, rtol=PVALUE_RTOL, name="pvalue")
+    keep = _cooks_comparable(dds)
+    helpers.assert_fields_close(
+        res["pvalue"][keep], pvalues[keep], rtol=PVALUE_RTOL, name="pvalue"
+    )
 
     padj, _ = reference_independent_filtering(res["baseMean"], res["pvalue"], 0.05)
     # BH multiplies p-values by at most m / rank and takes running minima.
@@ -507,12 +545,14 @@ def test_summary_cooks_filter(dataset, request):
     """``cooks_filter`` sets the p-values of Cook's outliers to NaN, and only those."""
     dds = request.getfixturevalue(dataset)
     outliers = reference_cooks_outlier(dds)
+    keep = _cooks_comparable(dds)
     filtered, unfiltered = _stats(dds), _stats(dds, cooks_filter=False)
     filtered.summary()
     unfiltered.summary()
     no_pvalue = unfiltered.results_df["pvalue"].isna().to_numpy()
     np.testing.assert_array_equal(
-        filtered.results_df["pvalue"].isna().to_numpy(), no_pvalue | outliers
+        filtered.results_df["pvalue"].isna().to_numpy()[keep],
+        (no_pvalue | outliers)[keep],
     )
     if dataset == "few_replicates":
         # Outlier counts 100 times the mean, in groups too small to replace them.
@@ -531,18 +571,30 @@ def test_summary_cooks_filter(dataset, request):
 def test_cooks_outlier_matches_rule(dataset, request):
     """``DeseqDataSet.cooks_outlier`` against DESeq2's rule (two-group designs)."""
     dds = request.getfixturevalue(dataset)
+    keep = _cooks_comparable(dds)
     np.testing.assert_array_equal(
-        dds.cooks_outlier().to_numpy(dtype=bool), reference_cooks_outlier(dds)
+        dds.cooks_outlier().to_numpy(dtype=bool)[keep],
+        reference_cooks_outlier(dds)[keep],
     )
+
+
+def test_cooks_outlier_two_larger_counts(few_replicates):
+    """A gene stays a Cook's outlier when fewer than three samples have a larger count
+    than its sample with the largest Cook's distance (here two do)."""
+    dds = few_replicates
+    g = list(dds.var_names).index("two_larger")
+    cooks = dds.layers["cooks"][:, g]
+    assert np.nanmax(cooks) > _cooks_cutoff(dds)
+    at_max = np.nanargmax(cooks)
+    assert np.sum(np.asarray(dds.X)[:, g] > dds.X[at_max, g]) == 2
+    assert dds.cooks_outlier()["two_larger"]
 
 
 def test_cooks_outliers_include_injected_outliers(few_replicates):
     """Counts 100 times their mean (simulator truth) are flagged when the mean is at
     least 20; a lower one need not be, as a count of 100 x mu may have three larger
     counts in the gene."""
-    sim = helpers.simulate_counts(
-        n_genes=120, n_samples=12, seed=12, disp_scatter=0.3, n_outliers=8
-    )
+    sim = _few_replicates_sim()
     flagged = few_replicates.cooks_outlier()
     for gene in sim.counts.columns[sim.outliers.any()]:
         sample = sim.outliers[gene].to_numpy().argmax()
@@ -585,7 +637,9 @@ def test_summary_alternative_hypotheses(two_group, alt, lfc_null):
 
     ``lfc_null`` is log2 and the Wald test works in natural log; the statistic does
     not depend on the scale. p-values are compared where DESeq2's statistic is not
-    clipped to zero (known-bugs/D-alt-hypothesis-clipped-p-values.md).
+    clipped to zero (known-bugs/D-alt-hypothesis-clipped-p-values.md). The contrast
+    is a unit vector: for other contrasts the null is applied per coefficient
+    (known-bugs/D-lfc-null-applied-per-coefficient.md).
     """
     ds = _stats(two_group, lfc_null=lfc_null, alt_hypothesis=alt, cooks_filter=False)
     ds.summary()

@@ -35,7 +35,9 @@ pytestmark = helpers.PANDAS_DEPRECATION_FILTERS
 # shrunk natural-log coefficient (6.4e-3 on any coefficient) and relative objective
 # gaps up to 8.5e-6, over 820 simulated genes (2 to 5 coefficients, 6 to 18
 # samples, adaptive and unit prior scales). The tolerances below leave a 3x margin
-# on the coefficients and 10x on the objective.
+# on the coefficients and 10x on the objective. They hold for dispersions well above
+# 1e-6; below that L-BFGS-B stops early
+# (known-bugs/D-shrink-near-poisson-stops-early.md).
 SHRINK_ATOL = 2e-2
 SHRINK_OBJECTIVE_RTOL = 1e-4
 
