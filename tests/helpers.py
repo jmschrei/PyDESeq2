@@ -17,6 +17,11 @@ Contents:
   adjusted dispersion objective and its minimizer by grid plus bounded Brent search.
 - :func:`glm_objective`, :func:`reference_glm_mle`: the ridge-penalized NB GLM
   objective and its minimizer by Newton's method.
+- :func:`median_of_ratios`, :func:`lin_reg_mu`, :func:`rough_dispersions`,
+  :func:`moments_dispersions`: DESeq2's size factors, linear-model means and
+  starting dispersion estimates; :func:`gamma_identity_glm`,
+  :func:`reference_trend`: DESeq2's parametric dispersion trend
+  (``parametricDispersionFit``).
 - :func:`wald_reference`: DESeq2's Wald test (sandwich covariance with a ridge).
 - :func:`apeglm_objective`, :func:`apeglm_grad_hess`, :func:`reference_map`:
   apeglm's negative log posterior (NB likelihood, normal prior on the coefficients
@@ -660,6 +665,103 @@ def _glm_objective_magnitude(y, mu, disp, beta, ridge):
         log_comb + log1p_am / disp + np.abs(special.xlogy(y, disp * mu)) + y * log1p_am
     )
     return float(terms.sum() + 0.5 * ridge * np.sum(beta**2))
+
+
+# References for normalization and dispersions
+
+
+def median_of_ratios(counts, control=None):
+    """DESeq2's ``estimateSizeFactorsForMatrix`` (ratio type), written out.
+
+    Per sample (row), the median over genes with no zero count (and in ``control``,
+    a boolean mask over genes) of ``log(count) - mean_samples(log(count))``,
+    exponentiated. Not rescaled.
+    """
+    y = np.asarray(counts, dtype=float)
+    usable = (y > 0).all(axis=0)
+    if control is not None:
+        usable &= np.asarray(control)
+    log_y = np.log(y[:, usable])
+    return np.exp(np.median(log_y - log_y.mean(axis=0), axis=1))
+
+
+def lin_reg_mu(counts, size_factors, design_matrix, min_mu=0.5):
+    """DESeq2's ``linearModelMuNormalized``, floored at ``min_mu``.
+
+    Least squares of the normalized counts (samples x genes) on the design, times the
+    size factors. With one coefficient per group this is the group mean of the
+    normalized counts.
+    """
+    sf = np.asarray(size_factors, dtype=float)
+    normed = np.asarray(counts, dtype=float) / sf[:, None]
+    x = np.asarray(design_matrix, dtype=float)
+    beta = np.linalg.lstsq(x, normed, rcond=None)[0]
+    return np.maximum(sf[:, None] * (x @ beta), min_mu)
+
+
+def rough_dispersions(normed_counts, design_matrix):
+    """DESeq2's ``roughDispEstimate``, written from its definition.
+
+    Least-squares fitted values of the normalized counts, floored at 1, then
+    ``sum(((y - fit)^2 - fit) / fit^2) / (n - p)``, floored at 0.
+    """
+    x = np.asarray(design_matrix, dtype=float)
+    n, p = x.shape
+    fitted = np.maximum(x @ np.linalg.lstsq(x, normed_counts, rcond=None)[0], 1.0)
+    rough = (((normed_counts - fitted) ** 2 - fitted) / fitted**2).sum(axis=0)
+    return np.maximum(rough / (n - p), 0.0)
+
+
+def moments_dispersions(normed_counts, size_factors):
+    """DESeq2's ``momentsDispEstimate``: ``(var - mean(1/s) * mean) / mean^2``."""
+    means = normed_counts.mean(axis=0)
+    variances = normed_counts.var(axis=0, ddof=1)
+    return (variances - np.mean(1 / np.asarray(size_factors)) * means) / means**2
+
+
+def gamma_identity_glm(x, y, start, max_iter=200):
+    """Gamma GLM with identity link, fitted by IRLS as R's ``glm`` does.
+
+    With the identity link the working response is ``y`` and the weights are
+    ``1 / mu^2`` (the gamma variance function), so each step is a weighted least
+    squares solve. The maximizer minimizes ``sum(y / mu + log(mu))``.
+    """
+    beta = np.asarray(start, dtype=float)
+    for _ in range(max_iter):
+        w = 1.0 / (x @ beta) ** 2
+        new = np.linalg.solve((x.T * w) @ x, (x.T * w) @ y)
+        if np.max(np.abs(new - beta) / np.abs(new)) < 1e-13:
+            return new
+        beta = new
+    raise RuntimeError("gamma_identity_glm did not converge.")
+
+
+def reference_trend(normed_means, dispersions, *, min_disp=None):
+    """DESeq2's ``parametricDispersionFit``, written from its definition.
+
+    Starting from ``(0.1, 1)``, keep the genes whose dispersion is within
+    ``(1e-4, 15)`` times the current curve ``a0 + a1 / mean``, fit a gamma GLM with
+    identity link of dispersion on ``1 / mean`` to them, and repeat until the sum of
+    squared log changes of the coefficients is below 1e-6. With ``min_disp``, genes
+    whose dispersion is not above ``100 * min_disp`` are left out first, as
+    ``estimateDispersionsFit`` does (as are NaN dispersions). Returns the
+    coefficients and the mask of genes used in the last fit.
+    """
+    means = np.asarray(normed_means, dtype=float)
+    disps = np.asarray(dispersions, dtype=float)
+    use = np.ones(disps.shape, dtype=bool)
+    if min_disp is not None:
+        use = disps > 100 * min_disp
+    coefs = np.array([0.1, 1.0])
+    for _ in range(100):
+        with np.errstate(invalid="ignore"):
+            ratio = disps / (coefs[0] + coefs[1] / means)
+        good = use & (ratio > 1e-4) & (ratio < 15)
+        x = np.column_stack([np.ones(good.sum()), 1 / means[good]])
+        old, coefs = coefs, gamma_identity_glm(x, disps[good], coefs)
+        if np.sum(np.log(coefs / old) ** 2) < 1e-6:
+            return coefs, good
+    raise RuntimeError("reference_trend did not converge.")
 
 
 # References for testing and shrinkage

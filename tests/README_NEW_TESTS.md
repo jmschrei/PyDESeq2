@@ -342,6 +342,12 @@ Dispersions:
   `0.1 + 1 / mean` and reselects genes within `(1e-4, 15)` times the current curve
   before every fit. A few genes with a count in one sample (dispersion on the upper
   bound) are enough to move `a1` two- to threefold.
+- With three or fewer residual degrees of freedom, `fit_dispersion_prior` warns and
+  still uses `mad^2 - trigamma((n - p) / 2)`; DESeq2 1.50.2 replaces that formula
+  with a simulation-based estimate there (`estimateDispersionsPriorVar`). On 300
+  simulated genes with five samples and `~condition` the two gave 1.99 and 2.01.
+  The warning documents the simplification; the tests check the warning and the
+  formula.
 
 GLM fitting, Cook's distances and refit:
 

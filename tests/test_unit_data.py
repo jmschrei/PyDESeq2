@@ -27,20 +27,6 @@ DATA = Path(__file__).parent / "data" / "unit_a"
 EXACT_RTOL = 1e-12
 
 
-def median_of_ratios(counts, control=None):
-    """DESeq2's ``estimateSizeFactorsForMatrix`` (ratio type), written out.
-
-    Per sample, the median over genes with no zero count (and in ``control``) of
-    ``log(count) - mean_samples(log(count))``, exponentiated. Not rescaled.
-    """
-    y = np.asarray(counts, dtype=float)
-    usable = (y > 0).all(axis=0)
-    if control is not None:
-        usable &= np.asarray(control)
-    log_y = np.log(y[:, usable])
-    return np.exp(np.median(log_y - log_y.mean(axis=0), axis=1))
-
-
 def poscounts_size_factors(counts, control=None):
     """DESeq2's ``estimateSizeFactors(type = "poscounts")``, written out.
 
@@ -161,7 +147,7 @@ def test_ratio_size_factors_match_reference():
     dds = helpers.make_dds(counts, sim.metadata)
     dds.fit_size_factors()
 
-    expected = median_of_ratios(counts)
+    expected = helpers.median_of_ratios(counts)
     helpers.assert_fields_close(
         dds.obs["size_factors"].to_numpy(), expected, rtol=EXACT_RTOL, name="sf"
     )
@@ -475,7 +461,7 @@ def test_deseq2_norm_hand_worked(as_frame):
 def test_deseq2_norm_matches_reference_simulated():
     sim, counts = _ratio_dataset()
     normed, sf = preprocessing.deseq2_norm(counts)
-    expected = median_of_ratios(counts)
+    expected = helpers.median_of_ratios(counts)
     np.testing.assert_allclose(np.asarray(sf), expected, rtol=EXACT_RTOL)
     np.testing.assert_allclose(
         np.asarray(normed), counts.to_numpy() / expected[:, None], rtol=EXACT_RTOL

@@ -56,81 +56,6 @@ def _grid_log_tolerance(min_disp, max_disp, grid_length=100):
     return 2 * delta / (grid_length - 1)
 
 
-# Reference implementations shared with test_unit_dispersions_dds.py.
-
-
-def _lin_reg_mu(counts, size_factors, design_matrix, min_mu=0.5):
-    """DESeq2's ``linearModelMuNormalized``, floored at ``min_mu``.
-
-    Least squares of the normalized counts on the design, times the size factors.
-    With one coefficient per group this is the group mean of the normalized counts.
-    """
-    sf = np.asarray(size_factors, dtype=float)
-    normed = np.asarray(counts, dtype=float) / sf[:, None]
-    x = np.asarray(design_matrix, dtype=float)
-    beta = np.linalg.lstsq(x, normed, rcond=None)[0]
-    return np.maximum(sf[:, None] * (x @ beta), min_mu)
-
-
-def _rough_dispersions(normed_counts, design_matrix):
-    """DESeq2's ``roughDispEstimate``, written from its definition.
-
-    Least-squares fitted values of the normalized counts, floored at 1, then
-    ``sum(((y - fit)^2 - fit) / fit^2) / (n - p)``, floored at 0.
-    """
-    x = np.asarray(design_matrix, dtype=float)
-    n, p = x.shape
-    fitted = np.maximum(x @ np.linalg.lstsq(x, normed_counts, rcond=None)[0], 1.0)
-    rough = (((normed_counts - fitted) ** 2 - fitted) / fitted**2).sum(axis=0)
-    return np.maximum(rough / (n - p), 0.0)
-
-
-def _moments_dispersions(normed_counts, size_factors):
-    """DESeq2's ``momentsDispEstimate``: ``(var - mean(1/s) * mean) / mean^2``."""
-    means = normed_counts.mean(axis=0)
-    variances = normed_counts.var(axis=0, ddof=1)
-    return (variances - np.mean(1 / np.asarray(size_factors)) * means) / means**2
-
-
-def _gamma_identity_glm(x, y, start, max_iter=200):
-    """Gamma GLM with identity link, fitted by IRLS as R's ``glm`` does.
-
-    With the identity link the working response is ``y`` and the weights are
-    ``1 / mu^2`` (the gamma variance function), so each step is a weighted least
-    squares solve. The maximizer minimizes ``sum(y / mu + log(mu))``.
-    """
-    beta = np.asarray(start, dtype=float)
-    for _ in range(max_iter):
-        w = 1.0 / (x @ beta) ** 2
-        new = np.linalg.solve((x.T * w) @ x, (x.T * w) @ y)
-        if np.max(np.abs(new - beta) / np.abs(new)) < 1e-13:
-            return new
-        beta = new
-    raise RuntimeError("_gamma_identity_glm did not converge.")
-
-
-def _reference_trend(normed_means, dispersions):
-    """DESeq2's ``parametricDispersionFit``, written from its definition.
-
-    Starting from ``(0.1, 1)``, keep the genes whose dispersion is within
-    ``(1e-4, 15)`` times the current curve ``a0 + a1 / mean``, fit a gamma GLM with
-    identity link of dispersion on ``1 / mean`` to them, and repeat until the sum of
-    squared log changes of the coefficients is below 1e-6. Returns the coefficients
-    and the mask of genes used in the last fit.
-    """
-    means = np.asarray(normed_means, dtype=float)
-    disps = np.asarray(dispersions, dtype=float)
-    coefs = np.array([0.1, 1.0])
-    for _ in range(100):
-        ratio = disps / (coefs[0] + coefs[1] / means)
-        good = (ratio > 1e-4) & (ratio < 15)
-        x = np.column_stack([np.ones(good.sum()), 1 / means[good]])
-        old, coefs = coefs, _gamma_identity_glm(x, disps[good], coefs)
-        if np.sum(np.log(coefs / old) ** 2) < 1e-6:
-            return coefs, good
-    raise RuntimeError("_reference_trend did not converge.")
-
-
 # Pilot tests (kept).
 
 
@@ -305,7 +230,7 @@ def test_fit_rough_dispersions_matches_definition():
     """
     x = _rough_design()
     normed = _rough_counts()
-    expected = _rough_dispersions(normed, x)
+    expected = helpers.rough_dispersions(normed, x)
 
     # The inputs reach the two floors the definition has.
     assert expected[2] == 0.0
@@ -352,14 +277,14 @@ def test_inference_dispersion_estimators(inference):
     normed = _rough_counts()
     np.testing.assert_allclose(
         inference.fit_rough_dispersions(normed, x),
-        _rough_dispersions(normed, x),
+        helpers.rough_dispersions(normed, x),
         rtol=1e-9,
         atol=1e-12,
     )
     sf = np.array([0.6, 1.3, 0.9, 1.1, 0.8, 1.4, 1.0, 1.2])
     np.testing.assert_allclose(
         inference.fit_moments_dispersions(normed, sf),
-        _moments_dispersions(normed, sf),
+        helpers.moments_dispersions(normed, sf),
         rtol=1e-12,
     )
 
@@ -842,7 +767,7 @@ def test_alpha_mle_one_and_two_genes(inference, n_genes):
 def test_dispersion_trend_gamma_glm_matches_reference(inference):
     """One gamma GLM fit (identity link) of dispersions on ``1 / mean``.
 
-    Compared with IRLS (``_gamma_identity_glm``, run to 1e-13). The method minimizes
+    Compared with IRLS (``helpers.gamma_identity_glm``, run to 1e-13). The method minimizes
     the same objective with L-BFGS-B (default tolerances), which agreed with IRLS to
     better than 1e-5 relative on the trend fits measured; 1e-4 relative is the
     tolerance. Predictions are ``a0 + a1 / mean`` for the returned coefficients.
@@ -859,7 +784,7 @@ def test_dispersion_trend_gamma_glm_matches_reference(inference):
         covariates, targets
     )
     x = np.column_stack([np.ones(300), 1 / means])
-    expected = _gamma_identity_glm(x, disps, np.array([0.1, 1.0]))
+    expected = helpers.gamma_identity_glm(x, disps, np.array([0.1, 1.0]))
     assert converged
     np.testing.assert_allclose(coeffs, expected, rtol=1e-4)
     np.testing.assert_allclose(predictions, x @ np.asarray(coeffs), rtol=1e-12)

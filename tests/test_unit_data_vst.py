@@ -50,13 +50,6 @@ def vst_from_variance(normed_counts, a0, a1):
     return (np.log(c / (4 * a0)) + 2 * np.arcsinh(np.sqrt(a0 * q / c))) / np.log(2)
 
 
-def median_of_ratios(counts):
-    """DESeq2's median-of-ratios size factors (genes with a zero count left out)."""
-    y = np.asarray(counts, dtype=float)
-    log_y = np.log(y[:, (y > 0).all(axis=0)])
-    return np.exp(np.median(log_y - log_y.mean(axis=0), axis=1))
-
-
 def reference_genewise(counts, size_factors, groups):
     """Gene-wise dispersions for a one-factor design (``groups``), or intercept-only.
 
@@ -74,21 +67,10 @@ def reference_genewise(counts, size_factors, groups):
     levels = np.unique(groups)
     x = (groups[:, None] == levels[None, :]).astype(float)
     normed = y / size_factors[:, None]
-    group_means = np.empty_like(normed)
-    for level in levels:
-        group_means[groups == level] = normed[groups == level].mean(axis=0)
-    mu = np.maximum(size_factors[:, None] * group_means, 0.5)
-
-    fitted = np.maximum(group_means, 1.0)
-    rough = np.maximum(
-        (((normed - fitted) ** 2 - fitted) / fitted**2).sum(axis=0) / (n - len(levels)),
-        0,
-    )
-    means = normed.mean(axis=0)
+    mu = helpers.lin_reg_mu(y, size_factors, x)
+    rough = helpers.rough_dispersions(normed, x)
     with np.errstate(divide="ignore", invalid="ignore"):
-        moments = (normed.var(axis=0, ddof=1) - (1 / size_factors).mean() * means) / (
-            means**2
-        )
+        moments = helpers.moments_dispersions(normed, size_factors)
     all_zero = (y == 0).all(axis=0)
     skip = all_zero | ~(np.minimum(rough, np.nan_to_num(moments)) > MIN_DISP)
 
@@ -100,43 +82,6 @@ def reference_genewise(counts, size_factors, groups):
     return dispersions, skip
 
 
-def _gamma_identity_fit(disps, means, start):
-    # Gamma GLM with identity link, disps ~ a0 + a1 / means: Newton's method on
-    # sum(d / mu + log mu), the gamma deviance up to constants.
-    x = np.column_stack([np.ones_like(means), 1.0 / means])
-    coefs = np.asarray(start, dtype=float)
-    for _ in range(200):
-        mu = x @ coefs
-        grad = x.T @ (1 / mu - disps / mu**2)
-        hess = (x.T * (2 * disps / mu**3 - 1 / mu**2)) @ x
-        step = np.linalg.solve(hess, grad)
-        t = 1.0
-        while np.any(x @ (coefs - t * step) <= 0):
-            t /= 2
-        coefs = coefs - t * step
-        if np.max(np.abs(step / coefs)) < 1e-13:
-            return coefs
-    raise RuntimeError("gamma fit did not converge")
-
-
-def reference_trend(disps, means):
-    """DESeq2's ``parametricDispersionFit`` on genes with dispersion above
-    ``100 * min_disp``: starting from (0.1, 1), refit on the genes whose ratio to the
-    current curve is in (1e-4, 15) until the coefficients change by less than 1e-6 in
-    summed squared log ratio. Returns ``(a0, a1)``."""
-    use = disps > 100 * MIN_DISP
-    d, m = disps[use], means[use]
-    coefs = np.array([0.1, 1.0])
-    for _ in range(20):
-        ratio = d / (coefs[0] + coefs[1] / m)
-        good = (ratio > 1e-4) & (ratio < 15)
-        old = coefs
-        coefs = _gamma_identity_fit(d[good], m[good], old)
-        if np.sum(np.log(coefs / old) ** 2) < 1e-6:
-            return coefs
-    raise RuntimeError("trend fit did not converge")
-
-
 def read_fixture():
     counts = pd.read_csv(DATA / "vst_counts.csv", index_col=0)
     metadata = pd.read_csv(DATA / "vst_metadata.csv", index_col=0)
@@ -145,7 +90,7 @@ def read_fixture():
 
 def check_genewise(dds, counts, groups):
     """Compare ``var["vst_genewise_dispersions"]`` with :func:`reference_genewise`."""
-    sf = median_of_ratios(counts)
+    sf = helpers.median_of_ratios(counts)
     expected, skip = reference_genewise(counts.to_numpy(), sf, groups)
     actual = dds.var["vst_genewise_dispersions"]
     all_zero = (counts == 0).all(axis=0).to_numpy()
@@ -161,11 +106,13 @@ def check_genewise(dds, counts, groups):
 
 def check_trend(dds, counts):
     """``uns["vst_trend_coeffs"]`` is DESeq2's trend fit of the gene-wise dispersions."""
-    sf = median_of_ratios(counts)
+    sf = helpers.median_of_ratios(counts)
     disps = dds.var["vst_genewise_dispersions"].to_numpy()
     means = (counts.to_numpy() / sf[:, None]).mean(axis=0)
     fitted = ~np.isnan(disps)
-    expected = reference_trend(disps[fitted], means[fitted])
+    expected, _ = helpers.reference_trend(
+        means[fitted], disps[fitted], min_disp=MIN_DISP
+    )
     np.testing.assert_allclose(
         dds.uns["vst_trend_coeffs"][["a0", "a1"]].to_numpy(), expected, rtol=TREND_RTOL
     )
@@ -183,7 +130,7 @@ def test_vst_parametric_matches_reference(use_design):
     design = pd.DataFrame(dds.obsm["design_matrix"]).copy()
     dds.vst(use_design=use_design)
 
-    sf = median_of_ratios(counts)
+    sf = helpers.median_of_ratios(counts)
     np.testing.assert_allclose(dds.obs["size_factors"], sf, rtol=1e-12)
     check_genewise(dds, counts, metadata["condition"] if use_design else None)
     check_trend(dds, counts)
@@ -216,7 +163,7 @@ def test_vst_mean_fit_matches_reference(use_design):
     disps = np.sort(disps[disps > 10 * MIN_DISP])
     k = int(0.001 * len(disps))
     mean_disp = disps[k : len(disps) - k].mean()
-    sf = median_of_ratios(counts)
+    sf = helpers.median_of_ratios(counts)
     np.testing.assert_allclose(
         dds.layers["vst_counts"],
         vst_from_variance(counts.to_numpy() / sf[:, None], mean_disp, 0.0),
@@ -246,7 +193,7 @@ def test_vst_mean_fit_leaves_out_dispersions_at_min_disp():
     low = disps <= 10 * MIN_DISP
     assert low[["flat1", "flat2", "flat3"]].all()
     mean_disp = disps[~low].mean()
-    sf = median_of_ratios(counts)
+    sf = helpers.median_of_ratios(counts)
     np.testing.assert_allclose(
         dds.layers["vst_counts"],
         vst_from_variance(counts.to_numpy() / sf[:, None], mean_disp, 0.0),
@@ -383,7 +330,7 @@ def test_vst_transform_after_iterative_size_factors():
     with pytest.warns(UserWarning, match="size factors were fitted iteratively"):
         result = dds.vst_transform(test.to_numpy())
     a0, a1 = dds.uns["vst_trend_coeffs"][["a0", "a1"]]
-    sf = median_of_ratios(test)
+    sf = helpers.median_of_ratios(test)
     np.testing.assert_allclose(
         result, vst_from_variance(test.to_numpy() / sf[:, None], a0, a1), rtol=1e-10
     )
@@ -468,7 +415,7 @@ def test_vst_with_continuous_covariate():
     y = sim.counts.to_numpy(dtype=float)
     x = sim.design_matrix.to_numpy()
     n, p = x.shape
-    sf = median_of_ratios(sim.counts)
+    sf = helpers.median_of_ratios(sim.counts)
     normed = y / sf[:, None]
     fitted = np.maximum(x @ np.linalg.lstsq(x, normed, rcond=None)[0], 1.0)
     rough = np.maximum(

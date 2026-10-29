@@ -18,10 +18,6 @@ from pydeseq2.default_inference import DefaultInference
 from tests import helpers
 from tests.test_unit_dispersions import BOUND_RTOL
 from tests.test_unit_dispersions import DISPERSION_RTOL
-from tests.test_unit_dispersions import _lin_reg_mu
-from tests.test_unit_dispersions import _moments_dispersions
-from tests.test_unit_dispersions import _reference_trend
-from tests.test_unit_dispersions import _rough_dispersions
 
 pytestmark = helpers.PANDAS_DEPRECATION_FILTERS
 
@@ -77,8 +73,8 @@ def _starting_dispersions(dds, size_factors, design_matrix, max_disp):
     # DESeq2's starting value: min(rough, moments), clipped to [min_disp, max_disp].
     normed = dds.X / size_factors[:, None]
     start = np.minimum(
-        _rough_dispersions(normed, design_matrix),
-        _moments_dispersions(normed, size_factors),
+        helpers.rough_dispersions(normed, design_matrix),
+        helpers.moments_dispersions(normed, size_factors),
     )
     return np.clip(start, dds.min_disp, max_disp)
 
@@ -211,7 +207,7 @@ def test_genewise_dispersions_capped_at_max_disp(n_samples, max_disp):
     )
     bound = max(max_disp, n_samples)
     x = sim.design_matrix.to_numpy()
-    mu = _lin_reg_mu(dds.X, dds.obs["size_factors"].to_numpy(), x)
+    mu = helpers.lin_reg_mu(dds.X, dds.obs["size_factors"].to_numpy(), x)
     for gene in ["single_sample1", "single_sample2"]:
         j = dds.var_names.get_loc(gene)
         expected = helpers.reference_dispersion_mle(
@@ -242,7 +238,7 @@ def test_genewise_dispersions_with_min_disp():
         helpers.make_dds(sim.counts, sim.metadata, min_disp=0.01), through="genewise"
     )
     x = sim.design_matrix.to_numpy()
-    mu = _lin_reg_mu(dds.X, dds.obs["size_factors"].to_numpy(), x)
+    mu = helpers.lin_reg_mu(dds.X, dds.obs["size_factors"].to_numpy(), x)
     expected = np.array(
         [
             helpers.reference_dispersion_mle(
@@ -270,7 +266,7 @@ def test_dispersions_of_genes_with_an_all_zero_group():
     The linear-model mean of the empty group is 0. DESeq2 scales the fitted
     normalized means by the size factors and then floors them at ``min_mu=0.5``
     (``linearModelMuNormalized``, then ``pmax(mu, minmu)``), so every sample of that
-    group gets a mean of 0.5 whatever its size factor; ``_lin_reg_mu`` does the
+    group gets a mean of 0.5 whatever its size factor; ``helpers.lin_reg_mu`` does the
     same. Gene-wise and MAP dispersions of these genes and of the regular ones are
     compared with the reference at those means (``DISPERSION_RTOL``). Flooring before
     the scaling moves these genes' dispersions by 4% to 17%.
@@ -294,7 +290,7 @@ def test_dispersions_of_genes_with_an_all_zero_group():
 
     sf = dds.obs["size_factors"].to_numpy()
     x = sim.design_matrix.to_numpy()
-    mu = _lin_reg_mu(dds.X, sf, x)
+    mu = helpers.lin_reg_mu(dds.X, sf, x)
     assert (mu[~in_b][:, -8:] == 0.5).all()
     start = _starting_dispersions(dds, sf, x, max(10.0, dds.n_obs))
     fitted = dds.var["fitted_dispersions"].to_numpy()
@@ -333,7 +329,7 @@ def test_dispersions_of_genes_with_an_all_zero_group():
 def test_parametric_trend_matches_reference():
     """``fit_dispersion_trend`` (parametric) against DESeq2's algorithm written out.
 
-    ``_reference_trend`` is DESeq2's ``parametricDispersionFit`` with IRLS for the
+    ``helpers.reference_trend`` is DESeq2's ``parametricDispersionFit`` with IRLS for the
     gamma GLM, applied to PyDESeq2's own gene-wise dispersions and the means of the
     normalized counts. The data include genes at ``min_disp``, which the iteration
     leaves out. Coefficients within ``TREND_RTOL``; ``var["fitted_dispersions"]`` is
@@ -350,7 +346,7 @@ def test_parametric_trend_matches_reference():
     non_zero = dds.var["non_zero"].to_numpy()
     means = _normed_means(dds)
     genewise = dds.var["genewise_dispersions"].to_numpy()
-    expected, used = _reference_trend(means[non_zero], genewise[non_zero])
+    expected, used = helpers.reference_trend(means[non_zero], genewise[non_zero])
     assert (~used).sum() >= 5  # the iteration leaves some genes out
 
     assert dds.uns["disp_function_type"] == "parametric"
@@ -521,7 +517,7 @@ def test_map_dispersions_and_outlier_rule():
     dds = _fit_dispersions(helpers.make_dds(counts, sim.metadata))
     non_zero = dds.var["non_zero"].to_numpy()
     x = sim.design_matrix.to_numpy()
-    mu = _lin_reg_mu(dds.X, dds.obs["size_factors"].to_numpy(), x)
+    mu = helpers.lin_reg_mu(dds.X, dds.obs["size_factors"].to_numpy(), x)
     fitted = dds.var["fitted_dispersions"].to_numpy()
     prior_var = float(dds.uns["prior_disp_var"])
     expected = np.full(dds.n_vars, np.nan)
@@ -664,7 +660,7 @@ def test_one_and_two_gene_datasets(n_genes):
         return dds
 
     dds = run(sim.counts)
-    mu = _lin_reg_mu(dds.X, sf, x)
+    mu = helpers.lin_reg_mu(dds.X, sf, x)
     genewise = np.array(
         [
             helpers.reference_dispersion_mle(dds.X[:, j], mu[:, j], x)

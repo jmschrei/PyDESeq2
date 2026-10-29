@@ -425,6 +425,57 @@ def test_map_fallback_flips():
     assert list(helpers.map_fallback_flips(first, first)) == []
 
 
+def test_median_of_ratios_hand_worked():
+    """The worked example's size factors (with and without control genes) are exact
+    powers of two, so 1e-14 is rounding."""
+    ex = helpers.size_factor_example()
+    np.testing.assert_allclose(
+        helpers.median_of_ratios(ex["counts"]), ex["ratio_size_factors"], rtol=1e-14
+    )
+    control = ex["counts"].columns.isin(ex["control_genes"])
+    np.testing.assert_allclose(
+        helpers.median_of_ratios(ex["counts"], control=control),
+        ex["control_size_factors"],
+        rtol=1e-14,
+    )
+
+
+def test_lin_reg_mu_and_starting_dispersions_hand_worked():
+    """Two groups of three with unit size factors: the fit is the group mean, floored
+    at 0.5. Gene 1 is 1, 5, 9 | 10, 30, 50 (group means 5 and 30): the rough
+    estimate is ((16 + 0 + 16 - 15) / 25 + (400 + 0 + 400 - 90) / 900) / (6 - 2) and
+    the moments estimate (var - mean) / mean^2 with mean 17.5 and var 353.9. Gene 2
+    is zero in group A, so its fit there is floored."""
+    x = np.column_stack([np.ones(6), [0, 0, 0, 1, 1, 1]]).astype(float)
+    y = np.array([[1, 0], [5, 0], [9, 0], [10, 4], [30, 5], [50, 6]], dtype=float)
+    sf = np.ones(6)
+    mu = helpers.lin_reg_mu(y, sf, x)
+    np.testing.assert_allclose(mu[:, 0], [5, 5, 5, 30, 30, 30], rtol=1e-12)
+    np.testing.assert_allclose(mu[:, 1], [0.5, 0.5, 0.5, 5, 5, 5], rtol=1e-12)
+    rough = helpers.rough_dispersions(y[:, :1], x)
+    assert rough[0] == pytest.approx((17 / 25 + 710 / 900) / 4, rel=1e-12)
+    moments = helpers.moments_dispersions(y[:, :1], sf)
+    assert moments[0] == pytest.approx((353.9 - 17.5) / 17.5**2, rel=1e-12)
+
+
+def test_reference_trend_recovers_an_exact_curve():
+    """Dispersions exactly on ``0.08 + 3 / mean`` (and two far above it, which the
+    ``< 15`` window drops) give that curve; a gene at 100 min_disp is dropped only
+    when ``min_disp`` is given."""
+    means = np.geomspace(5, 5000, 40)
+    disps = 0.08 + 3 / means
+    disps[[3, 20]] *= 40
+    coefs, good = helpers.reference_trend(means, disps)
+    np.testing.assert_allclose(coefs, [0.08, 3.0], rtol=1e-9)
+    assert not good[[3, 20]].any() and good.sum() == 38
+    with_floor = np.append(disps, 1e-6)
+    coefs, good = helpers.reference_trend(
+        np.append(means, 50.0), with_floor, min_disp=1e-8
+    )
+    np.testing.assert_allclose(coefs, [0.08, 3.0], rtol=1e-9)
+    assert not good[-1]
+
+
 def test_compare_fields_names_the_differences():
     genes = ["g1", "g2", "g3"]
     expected = pd.DataFrame({"a": [1.0, 2.0, np.nan], "b": [1.0, 1.0, 1.0]}, index=genes)
