@@ -492,7 +492,7 @@ def test_deseq2_norm_matches_reference_simulated():
         np.array([[0.0, 3.0], [5.0, 10.0]]),
         np.zeros((2, 2), dtype=np.int64),
     ],
-    ids=["int frame", "integral float array", "zeros"],
+    ids=["int_frame", "integral_float_array", "zeros"],
 )
 def test_valid_counts_accepts_non_negative_integers(counts):
     misc.test_valid_counts(counts)
@@ -508,6 +508,15 @@ def test_valid_counts_accepts_non_negative_integers(counts):
         (np.array([[0.0, 1.5], [5.0, 10.0]]), "only contain integers"),
         (pd.DataFrame([[0, -1], [5, 10]]), "non-negative"),
         (np.array([[0, -1], [5, 10]]), "non-negative"),
+    ],
+    ids=[
+        "nan_frame",
+        "nan_array",
+        "string_frame",
+        "fraction_frame",
+        "fraction_array",
+        "negative_frame",
+        "negative_array",
     ],
 )
 def test_valid_counts_rejects_invalid_counts(counts, message):

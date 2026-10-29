@@ -111,6 +111,7 @@ def test_deprecated_arguments_warn():
         ("~group + condition:group", {"condition", "group"}),
         ("condition + age", {"condition", "age"}),
     ],
+    ids=["one_factor", "additive", "interaction", "no_tilde"],
 )
 def test_variables(design, expected):
     sim = _small_dataset(n_genes=5, n_samples=8)

@@ -224,6 +224,36 @@ def test_vst_mean_fit_matches_reference(use_design):
     )
 
 
+def test_vst_mean_fit_leaves_out_dispersions_at_min_disp():
+    """Genes whose counts follow the size factors closely (less variance than a
+    Poisson) have their dispersion minimizer at ``min_disp``; the mean trend leaves
+    them out, as DESeq2's ``dispGeneEst > 10 * minDisp`` does."""
+    sim = helpers.simulate_counts(n_genes=60, n_samples=8, seed=303)
+    flat = np.rint(np.outer(sim.size_factors, [20.0, 50.0, 100.0])).astype(int)
+    counts = pd.concat(
+        [
+            sim.counts,
+            pd.DataFrame(
+                flat, index=sim.counts.index, columns=["flat1", "flat2", "flat3"]
+            ),
+        ],
+        axis=1,
+    )
+    dds = helpers.make_dds(counts, sim.metadata)
+    dds.vst(use_design=False, fit_type="mean")
+
+    disps = dds.var["vst_genewise_dispersions"]
+    low = disps <= 10 * MIN_DISP
+    assert low[["flat1", "flat2", "flat3"]].all()
+    mean_disp = disps[~low].mean()
+    sf = median_of_ratios(counts)
+    np.testing.assert_allclose(
+        dds.layers["vst_counts"],
+        vst_from_variance(counts.to_numpy() / sf[:, None], mean_disp, 0.0),
+        rtol=FORMULA_RTOL,
+    )
+
+
 # PyDESeq2's gene-wise dispersions reach the minimizer of the Cox-Reid objective
 # (DISPERSION_RTOL); DESeq2's line search stops short of it on high-count genes (up to
 # 12% in dispersion, 0.03 in objective on this data, checked against the reference
@@ -267,6 +297,42 @@ def test_vst_fit_then_transform_equals_vst():
     np.testing.assert_allclose(
         two.vst_transform(), one.layers["vst_counts"], rtol=FORMULA_RTOL
     )
+
+
+def test_vst_after_deseq2_leaves_its_results():
+    """A blind VST after ``deseq2`` gives the VST of a fresh dataset and leaves the
+    size factors, dispersions, LFCs and design of the fit as they were (the VST
+    writes to its own fields; the values are not recomputed, so they agree to
+    rounding at most)."""
+    sim = helpers.simulate_counts(
+        n_genes=60, n_samples=8, seed=304, n_all_zero=1, disp_scatter=0.3
+    )
+    fresh = helpers.make_dds(sim.counts, sim.metadata)
+    fresh.vst(use_design=False)
+
+    dds = helpers.make_dds(sim.counts, sim.metadata)
+    dds.deseq2()
+    columns = ["genewise_dispersions", "fitted_dispersions", "MAP_dispersions"]
+    before = (
+        dds.obs["size_factors"].copy(),
+        dds.var[[*columns, "dispersions"]].copy(),
+        dds.varm["LFC"].copy(),
+        pd.DataFrame(dds.obsm["design_matrix"]).copy(),
+        dds.uns["trend_coeffs"].copy(),
+    )
+    dds.vst(use_design=False)
+
+    np.testing.assert_allclose(
+        dds.layers["vst_counts"], fresh.layers["vst_counts"], rtol=FORMULA_RTOL
+    )
+    sf, var, lfc, design, trend = before
+    helpers.assert_fields_close(dds.obs["size_factors"], sf, rtol=1e-12, name="sf")
+    helpers.assert_fields_close(
+        dds.var[[*columns, "dispersions"]], var, rtol=1e-12, name="var"
+    )
+    helpers.assert_fields_close(dds.varm["LFC"], lfc, rtol=1e-12, name="LFC")
+    pd.testing.assert_frame_equal(pd.DataFrame(dds.obsm["design_matrix"]), design)
+    pd.testing.assert_series_equal(dds.uns["trend_coeffs"], trend)
 
 
 def _train_test():
