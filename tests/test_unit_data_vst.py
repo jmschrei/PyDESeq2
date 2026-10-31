@@ -33,6 +33,43 @@ TREND_RTOL = 2e-3
 # reference below is a different closed form of the same function, so the two agree
 # to rounding.
 FORMULA_RTOL = 1e-10
+# When L-BFGS-B reports failure on a gene-wise fit, fit_alpha_mle returns
+# grid_fit_alpha's value instead, which is within half a step of its fine grid of the
+# minimizer (up to 2.1e-3 relative at max_disp 10). L-BFGS-B reports failure (an
+# abnormal line search) on a few genes whose fit ends at its gradient tolerance, and
+# which genes do moves with rounding: with their means changed by 1e-11 relative, one
+# to four genes per dataset below failed in some of 200 fits (OpenBLAS Haswell and
+# SkylakeX kernels), and gene30 of the continuous-covariate data fails on some Windows
+# CI runners. Such genes are compared at one full fine step, which covers the half
+# step and the reference's own error, and at most this many per comparison.
+MAX_GENEWISE_FALLBACKS = 2
+
+
+def grid_fallback_rtol(max_disp, min_disp=MIN_DISP, grid_length=100):
+    """One step of ``grid_fit_alpha``'s fine grid, as a relative tolerance.
+
+    The coarse grid has ``grid_length`` points from ``log(min_disp)`` to
+    ``log(max_disp)``; the fine grid spans the two coarse cells around the coarse
+    minimum with ``grid_length`` points, so for a unimodal objective its minimum is
+    within half a fine step of the minimizer.
+    """
+    delta = np.log(max_disp / min_disp) / (grid_length - 1)
+    return np.expm1(2 * delta / (grid_length - 1))
+
+
+def assert_genewise_close(actual, expected, *, rtol, max_disp):
+    """Gene-wise dispersions within ``rtol``, except at most
+    ``MAX_GENEWISE_FALLBACKS`` genes, which are within :func:`grid_fallback_rtol`
+    (genes that took the grid fallback; see ``MAX_GENEWISE_FALLBACKS``)."""
+    rel = np.abs(actual.to_numpy() / expected.to_numpy() - 1)
+    fallback = (rel > rtol) & (rel <= grid_fallback_rtol(max_disp))
+    assert fallback.sum() <= MAX_GENEWISE_FALLBACKS, list(actual.index[fallback])
+    helpers.assert_fields_close(
+        actual[~fallback],
+        expected[~fallback],
+        rtol=rtol,
+        name="vst_genewise_dispersions",
+    )
 
 
 def vst_from_variance(normed_counts, a0, a1):
@@ -96,11 +133,11 @@ def check_genewise(dds, counts, groups):
     all_zero = (counts == 0).all(axis=0).to_numpy()
     np.testing.assert_array_equal(actual.isna().to_numpy(), all_zero)
     assert (~skip).sum() >= 0.8 * len(skip)
-    helpers.assert_fields_close(
+    assert_genewise_close(
         actual[~skip],
         pd.Series(expected[~skip], index=actual.index[~skip]),
         rtol=DISPERSION_RTOL,
-        name="vst_genewise_dispersions",
+        max_disp=max(10.0, len(counts)),
     )
 
 
@@ -406,7 +443,8 @@ def test_vst_with_continuous_covariate():
     IRLS stops at a relative deviance change of 1e-8, which leaves up to 3.4e-4 in
     natural-log coefficients (README_NEW_TESTS.md), and the dispersion MLE moves with
     the means it is given: the dispersions agreed to 1.9e-4 relative here, so they are
-    compared at 2e-3.
+    compared at 2e-3, except genes that took the grid fallback
+    (``MAX_GENEWISE_FALLBACKS``).
     """
     sim = helpers.simulate_counts(
         n_genes=60, n_samples=10, seed=302, continuous=("age",), disp_scatter=0.3
@@ -437,10 +475,10 @@ def test_vst_with_continuous_covariate():
             y[:, j], mu, x, min_disp=MIN_DISP, max_disp=max(10.0, n)
         )
     actual = dds.var["vst_genewise_dispersions"]
-    helpers.assert_fields_close(
+    assert_genewise_close(
         actual[keep],
         pd.Series(expected[keep], index=actual.index[keep]),
         rtol=2e-3,
-        name="vst_genewise_dispersions",
+        max_disp=max(10.0, n),
     )
     check_trend(dds, sim.counts)

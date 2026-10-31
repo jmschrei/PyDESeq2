@@ -146,6 +146,14 @@ Measured against the reference minimizers in `helpers.py` on simulated genes:
   `test_unit_dispersions.py` uses `rtol=1e-3`. Without Cox-Reid, near-Poisson genes
   have objectives so flat that L-BFGS-B stops far from the minimizer (relative
   error up to 350, objective gap up to 6.5e-6): compare objective values there.
+- When L-BFGS-B reports failure, `fit_alpha_mle` returns `grid_fit_alpha`'s value,
+  which is within half a step of its fine grid of the minimizer (up to 2.1e-3
+  relative at `max_disp` 10). L-BFGS-B reports failure (an abnormal line search) on
+  a few gene-wise fits that end at `pgtol`, and which genes do moves with changes of
+  1e-11 in their means, so a gene can take the fallback on one platform only (gene30
+  of `test_vst_with_continuous_covariate` on some Windows runners).
+  `test_unit_data_vst.py` compares at most two such genes per comparison at one
+  fine step.
 - `glm.irls_solver` (stops when the relative deviance change is below
   `beta_tol=1e-8`) with the true dispersion: absolute coefficient error (natural
   log) up to 2.2e-5 with two coefficients and 3.4e-4 with five (two factors and a
