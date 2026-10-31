@@ -1,12 +1,12 @@
 name: Test
 
+# Fork-only copy for ci-os/* branches: the upstream test job on Linux, Windows
+# and macOS, each with the resolved dependencies and with pandas<3.1 pinned.
+# Codecov upload is left out (no token on the fork).
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  schedule:
-    - cron: "0 5 1,15 * *"
+    branches: ["ci-os/**"]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -16,11 +16,6 @@ permissions:
   contents: read
 
 jobs:
-  # Get the test environment from hatch as defined in pyproject.toml.
-  # This ensures that the pyproject.toml is the single point of truth for test definitions and the same tests are
-  # run locally and on continuous integration.
-  # Check [[tool.hatch.envs.hatch-test.matrix]] in pyproject.toml and https://hatch.pypa.io/latest/environment/ for
-  # more details.
   get-environments:
     runs-on: ubuntu-slim
     outputs:
@@ -47,21 +42,25 @@ jobs:
               )')
           echo "envs=${ENVS_JSON}" | tee $GITHUB_OUTPUT
 
-  # Run tests through hatch. Spawns a separate runner for each environment defined in the hatch matrix obtained above.
   test:
     needs: get-environments
     permissions:
-       id-token: write  # for codecov OIDC
        contents: read
 
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         env: ${{ fromJSON(needs.get-environments.outputs.envs) }}
+        pandas:
+          - {name: as-resolved, pin: ""}
+          # A requirements file: hatch runs commands through cmd.exe on Windows,
+          # which reads the "<" of pandas<3.1 as a redirection.
+          - {name: pandas-lt-3.1, pin: .github/ci-os/pandas-lt-3.1.txt}
 
-    name: ${{ matrix.env.label }}
+    name: ${{ matrix.os }} | ${{ matrix.env.label }} | ${{ matrix.pandas.name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     continue-on-error: ${{ contains(matrix.env.name, 'pre') }}  # make "all-green" pass even if pre-release job fails
 
     steps:
@@ -76,28 +75,40 @@ jobs:
           python-version: ${{ matrix.env.python }}
       - name: create hatch environment
         run: uvx hatch env create ${{ matrix.env.name }}
+      - name: pin pandas<3.1
+        if: matrix.pandas.pin != ''
+        run: uvx hatch run ${{ matrix.env.name }}:uv pip install -r ${{ matrix.pandas.pin }}
       - name: list all all installed package versions
         run: uvx hatch run ${{ matrix.env.name }}:uv pip list
+      - name: pydeseq2 folders in joblib's temporary folder before the tests
+        run: uvx hatch run ${{ matrix.env.name }}:python .github/ci-os/leftovers.py --label before --out leftovers-before.json
       - name: run tests using hatch
         env:
           MPLBACKEND: agg
           PLATFORM: ${{ matrix.os }}
           DISPLAY: :42
-        run: uvx hatch run ${{ matrix.env.name }}:run-cov -v --color=yes -n auto
+        run: uvx hatch run ${{ matrix.env.name }}:run-cov -v --color=yes -n auto --junitxml=junit.xml
+      - name: pydeseq2 folders left in joblib's temporary folder after the tests
+        if: always()
+        run: uvx hatch run ${{ matrix.env.name }}:python .github/ci-os/leftovers.py --label after --out leftovers-after.json
       - name: generate coverage report
+        shell: bash
         run: |
           # See https://coverage.readthedocs.io/page/config.html#run-patch
           test -f .coverage || uvx hatch run ${{ matrix.env.name }}:cov-combine
           uvx hatch run ${{ matrix.env.name }}:cov-report   # report visibly
           uvx hatch run ${{ matrix.env.name }}:coverage xml # create report for upload
-      - name: Upload coverage
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+      - name: upload test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          fail_ci_if_error: true
-          use_oidc: true
+          name: tests-${{ matrix.os }}-${{ matrix.env.name }}-${{ matrix.pandas.name }}
+          path: |
+            junit.xml
+            leftovers-before.json
+            leftovers-after.json
+          if-no-files-found: warn
 
-  # Check that all tests defined above pass. This makes it easy to set a single "required" test in branch
-  # protection instead of having to update it frequently. See https://github.com/re-actors/alls-green#why.
   check:
     name: Tests pass in all hatch environments
     if: always()
