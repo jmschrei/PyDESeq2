@@ -9,6 +9,7 @@ Contents:
 - :func:`get_test_cpus`, :func:`make_dds`: run PyDESeq2 at a fixed ``n_cpus``.
 - :func:`map_fallback_flips`: genes whose MAP dispersion took different branches in
   two fits.
+- :func:`trend_coeffs`: the stored parametric trend coefficients, read by key.
 - :func:`simulate_counts`: seeded negative binomial counts with recorded truth.
 - :func:`size_factor_example`, :func:`nb_example`: small hand-worked inputs.
 - :func:`nb_logpmf`, :func:`nb_loglik`: reference likelihood (``scipy.stats.nbinom``
@@ -126,6 +127,15 @@ def make_dds(
     if kwargs.get("inference") is None:
         kwargs.setdefault("n_cpus", get_test_cpus())
     return DeseqDataSet(counts=counts, metadata=metadata, design=design, **kwargs)
+
+
+def trend_coeffs(coeffs) -> pd.Series:
+    """``a0`` and ``a1`` of a parametric trend fit, as a float Series with that index.
+
+    Reads ``uns["trend_coeffs"]`` or ``uns["vst_trend_coeffs"]`` by key, so the tests
+    pass whether PyDESeq2 stores the coefficients as a pandas Series or as a dict.
+    """
+    return pd.Series([coeffs["a0"], coeffs["a1"]], index=["a0", "a1"], dtype=float)
 
 
 # Simulation

@@ -181,7 +181,8 @@ def test_to_picklable_anndata():
         np.testing.assert_array_equal(restored.layers[key], dds.layers[key])
     assert set(restored.uns) == set(dds.uns)
     pd.testing.assert_series_equal(
-        restored.uns["vst_trend_coeffs"], dds.uns["vst_trend_coeffs"]
+        helpers.trend_coeffs(restored.uns["vst_trend_coeffs"]),
+        helpers.trend_coeffs(dds.uns["vst_trend_coeffs"]),
     )
     design = restored.obsm["design_matrix"]
     assert type(design) is pd.DataFrame

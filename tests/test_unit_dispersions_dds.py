@@ -361,8 +361,8 @@ def test_parametric_trend_matches_reference():
     assert (~used).sum() >= 5  # the iteration leaves some genes out
 
     assert dds.uns["disp_function_type"] == "parametric"
-    coeffs = dds.uns["trend_coeffs"]
-    assert list(coeffs.index) == ["a0", "a1"]
+    assert list(dds.uns["trend_coeffs"].keys()) == ["a0", "a1"]
+    coeffs = helpers.trend_coeffs(dds.uns["trend_coeffs"])
     np.testing.assert_allclose(coeffs.to_numpy(), expected, rtol=TREND_RTOL)
 
     a0, a1 = coeffs["a0"], coeffs["a1"]
@@ -392,7 +392,9 @@ def test_parametric_trend_drops_genes_far_from_the_curve():
     dds.var["genewise_dispersions"] = values
 
     dds.fit_dispersion_trend()
-    np.testing.assert_allclose(dds.uns["trend_coeffs"], [0.05, 2.0], rtol=TREND_RTOL)
+    np.testing.assert_allclose(
+        helpers.trend_coeffs(dds.uns["trend_coeffs"]), [0.05, 2.0], rtol=TREND_RTOL
+    )
     np.testing.assert_allclose(dds.var["fitted_dispersions"], curve, rtol=TREND_RTOL)
 
 
@@ -586,7 +588,9 @@ def _assert_same_dispersions(actual, expected, name, trend_rtol=DISPERSION_RTOL)
     )
     if "trend_coeffs" in expected.uns:
         np.testing.assert_allclose(
-            actual.uns["trend_coeffs"], expected.uns["trend_coeffs"], rtol=trend_rtol
+            helpers.trend_coeffs(actual.uns["trend_coeffs"]),
+            helpers.trend_coeffs(expected.uns["trend_coeffs"]),
+            rtol=trend_rtol,
         )
     assert float(actual.uns["prior_disp_var"]) == pytest.approx(
         float(expected.uns["prior_disp_var"]), rel=DISPERSION_RTOL
@@ -773,7 +777,7 @@ def test_trend_prior_and_outliers_match_deseq2(case, design):
     dds.var["genewise_dispersions"] = r_genewise
     dds.fit_dispersion_trend()
     np.testing.assert_allclose(
-        dds.uns["trend_coeffs"].to_numpy(),
+        helpers.trend_coeffs(dds.uns["trend_coeffs"]).to_numpy(),
         r_fit[["a0", "a1"]].to_numpy(),
         rtol=R_TREND_RTOL,
     )

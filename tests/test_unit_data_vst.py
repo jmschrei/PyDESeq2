@@ -114,7 +114,9 @@ def check_trend(dds, counts):
         means[fitted], disps[fitted], min_disp=MIN_DISP
     )
     np.testing.assert_allclose(
-        dds.uns["vst_trend_coeffs"][["a0", "a1"]].to_numpy(), expected, rtol=TREND_RTOL
+        helpers.trend_coeffs(dds.uns["vst_trend_coeffs"]).to_numpy(),
+        expected,
+        rtol=TREND_RTOL,
     )
 
 
@@ -135,7 +137,7 @@ def test_vst_parametric_matches_reference(use_design):
     check_genewise(dds, counts, metadata["condition"] if use_design else None)
     check_trend(dds, counts)
 
-    a0, a1 = dds.uns["vst_trend_coeffs"][["a0", "a1"]]
+    a0, a1 = helpers.trend_coeffs(dds.uns["vst_trend_coeffs"])
     np.testing.assert_allclose(
         dds.layers["vst_counts"],
         vst_from_variance(counts.to_numpy() / sf[:, None], a0, a1),
@@ -265,7 +267,7 @@ def test_vst_after_deseq2_leaves_its_results():
         dds.var[[*columns, "dispersions"]].copy(),
         dds.varm["LFC"].copy(),
         pd.DataFrame(dds.obsm["design_matrix"]).copy(),
-        dds.uns["trend_coeffs"].copy(),
+        helpers.trend_coeffs(dds.uns["trend_coeffs"]),
     )
     dds.vst(use_design=False)
 
@@ -279,7 +281,7 @@ def test_vst_after_deseq2_leaves_its_results():
     )
     helpers.assert_fields_close(dds.varm["LFC"], lfc, rtol=1e-12, name="LFC")
     pd.testing.assert_frame_equal(pd.DataFrame(dds.obsm["design_matrix"]), design)
-    pd.testing.assert_series_equal(dds.uns["trend_coeffs"], trend)
+    pd.testing.assert_series_equal(helpers.trend_coeffs(dds.uns["trend_coeffs"]), trend)
 
 
 def _train_test():
@@ -312,7 +314,7 @@ def test_vst_transform_new_counts(fit_type):
     normed = test.to_numpy() / test_sf[:, None]
 
     if fit_type == "parametric":
-        a0, a1 = dds.uns["vst_trend_coeffs"][["a0", "a1"]]
+        a0, a1 = helpers.trend_coeffs(dds.uns["vst_trend_coeffs"])
     else:
         disps = dds.var["vst_genewise_dispersions"].to_numpy()
         a0, a1 = disps[disps > 10 * MIN_DISP].mean(), 0.0
@@ -329,7 +331,7 @@ def test_vst_transform_after_iterative_size_factors():
     dds.vst_fit(use_design=False)
     with pytest.warns(UserWarning, match="size factors were fitted iteratively"):
         result = dds.vst_transform(test.to_numpy())
-    a0, a1 = dds.uns["vst_trend_coeffs"][["a0", "a1"]]
+    a0, a1 = helpers.trend_coeffs(dds.uns["vst_trend_coeffs"])
     sf = helpers.median_of_ratios(test)
     np.testing.assert_allclose(
         result, vst_from_variance(test.to_numpy() / sf[:, None], a0, a1), rtol=1e-10
@@ -346,7 +348,7 @@ INVARIANCE_RTOL = {"dispersions": DISPERSION_RTOL, "trend": TREND_RTOL, "vst": 1
 def _vst_outputs(dds):
     return (
         dds.var["vst_genewise_dispersions"],
-        dds.uns["vst_trend_coeffs"][["a0", "a1"]].to_numpy(),
+        helpers.trend_coeffs(dds.uns["vst_trend_coeffs"]).to_numpy(),
         pd.DataFrame(
             dds.layers["vst_counts"], index=dds.obs_names, columns=dds.var_names
         ),

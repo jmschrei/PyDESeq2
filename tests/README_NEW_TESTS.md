@@ -211,6 +211,8 @@ by up to 30%.
 - `get_test_cpus()`, `make_dds(...)`; fixtures `n_cpus`, `inference`.
 - `map_fallback_flips(first, second)`: genes whose MAP dispersion took L-BFGS-B in
   one fit and the grid fallback in the other (see the precision section).
+- `trend_coeffs(dds.uns["trend_coeffs"])`: `a0` and `a1` as a float Series, read by
+  key, whether PyDESeq2 stores them as a Series or a dict.
 - `simulate_counts(n_genes=200, n_samples=12, *, seed=0, factors={"condition":
   ["A", "B"]}, continuous=(), design=None, mean_range=(10, 5000), frac_de=0.3,
   lfc_sd=1.0, trend=(0.1, 4.0), disp_scatter=0.0, size_factor_sd=0.3, n_all_zero=0,
