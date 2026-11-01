@@ -1,0 +1,114 @@
+name: Compare outputs with main
+
+# Fork-only: install main and the commit under this one (HEAD^) into two
+# venvs with the same third-party versions, run deseq2(), summary() and
+# lfc_shrink() on the bundled example data and on a synthetic 40 x 8,000
+# matrix at n_cpus 1 and 2, and compare every output with main's.
+on:
+  push:
+    branches: ["ci-os/opt"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS repeated to land on more than one runner type (M1, M2 Pro).
+        os: [macos-latest]
+        rep: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        include:
+          - {os: ubuntu-latest, rep: 1}
+          - {os: ubuntu-latest, rep: 2}
+          - {os: windows-latest, rep: 1}
+          - {os: windows-latest, rep: 2}
+    name: compare (${{ matrix.os }} ${{ matrix.rep }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      MAIN_SHA: 2ca3b74c9b2b994b44c071f17ec76ad1cf1595e9
+      PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: ${{ env.PYTHON }}
+      - name: check out main and the optimization
+        run: |
+          OPT_SHA=$(git rev-parse HEAD^)
+          echo "main $MAIN_SHA, opt $OPT_SHA" | tee shas.txt
+          git worktree add --detach ../tree-main "$MAIN_SHA"
+          git worktree add --detach ../tree-opt "$OPT_SHA"
+          cp -r .github/ci-os ../ci-os
+      - name: make two venvs with the same dependency versions
+        run: |
+          uv venv ../venv-main --python "$PYTHON"
+          uv pip install --python ../venv-main -e ../tree-main
+          uv pip freeze --python ../venv-main | grep -iv pydeseq2 > ../constraints.txt
+          uv venv ../venv-opt --python "$PYTHON"
+          uv pip install --python ../venv-opt -e ../tree-opt -c ../constraints.txt
+          uv pip freeze --python ../venv-opt | grep -iv pydeseq2 > ../opt-freeze.txt
+          diff ../constraints.txt ../opt-freeze.txt && echo "third-party versions identical"
+          cat ../constraints.txt
+      - name: run deseq2, summary and lfc_shrink with each version
+        run: |
+          py() { if [ -x "../venv-$1/bin/python" ]; then echo "../venv-$1/bin/python"; else echo "../venv-$1/Scripts/python.exe"; fi; }
+          $(py main) ../ci-os/compare.py make-input ../synthetic.npz
+          for version in main opt; do
+            for data in example synthetic; do
+              for n in 1 2; do
+                $(py $version) ../ci-os/compare.py run --data $data --input ../synthetic.npz --n-cpus $n --out ../out/$version-$data-$n
+              done
+            done
+            # Controls: a repeat, and BLAS limited to one thread.
+            $(py $version) ../ci-os/compare.py run --data synthetic --input ../synthetic.npz --n-cpus 2 --out ../out/$version-synthetic-2-repeat
+            for n in 1 2; do
+              OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 MKL_NUM_THREADS=1 \
+                $(py $version) ../ci-os/compare.py run --data synthetic --input ../synthetic.npz --n-cpus $n --out ../out/$version-synthetic-$n-blas1
+            done
+          done
+          $(py opt) ../ci-os/leftovers.py --label after-compare-runs --out leftovers-compare.json
+      - name: compare outputs
+        run: |
+          py() { if [ -x "../venv-$1/bin/python" ]; then echo "../venv-$1/bin/python"; else echo "../venv-$1/Scripts/python.exe"; fi; }
+          cmp() { $(py main) ../ci-os/compare.py compare --ref ../out/$1 --new ../out/$2 --label "${{ matrix.os }} ${{ matrix.rep }} | $1 vs $2" --tsv compare.tsv; }
+          echo "== main versus opt"
+          for run in example-1 example-2 synthetic-1 synthetic-2 synthetic-2-repeat synthetic-1-blas1 synthetic-2-blas1; do
+            cmp main-$run opt-$run
+          done
+          echo "== controls: each version against itself"
+          for version in main opt; do
+            cmp $version-synthetic-1 $version-synthetic-2
+            cmp $version-synthetic-2 $version-synthetic-2-repeat
+            cmp $version-synthetic-1-blas1 $version-synthetic-2-blas1
+            cmp $version-synthetic-1 $version-synthetic-1-blas1
+            cmp $version-synthetic-2 $version-synthetic-2-blas1
+          done
+          cp ../constraints.txt constraints.txt
+          for f in ../out/*/record.json; do echo "== $f"; cat "$f"; done > records.txt
+      - name: upload comparison
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: compare-${{ matrix.os }}-${{ matrix.rep }}
+          path: |
+            shas.txt
+            compare.tsv
+            constraints.txt
+            records.txt
+            leftovers-compare.json
+          if-no-files-found: warn
